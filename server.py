@@ -28,6 +28,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import TCPServer, ThreadingMixIn
@@ -88,6 +89,16 @@ DEEP_TIMEOUT = int(os.environ.get("DEEP_TIMEOUT", "1800"))
 
 # An overall agenda the fast brain steers the call toward (phone-call mode).
 CALL_GOAL = os.environ.get("CALL_GOAL", "").strip()
+
+# Phone line — Twilio voice webhooks put the agent on a real call. Needs a
+# public HTTPS URL for Twilio to reach (e.g. `cloudflared tunnel --url
+# http://localhost:8790` — no account needed) set as PUBLIC_URL.
+TWILIO_SID    = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_NUMBER = os.environ.get("TWILIO_NUMBER", "")   # the agent's own line
+CALLER_ID     = os.environ.get("CALLER_ID", "") or TWILIO_NUMBER  # outbound from (verified)
+PUBLIC_URL    = os.environ.get("PUBLIC_URL", "").rstrip("/")
+PHONE_AVAILABLE = bool(TWILIO_SID and TWILIO_TOKEN and TWILIO_NUMBER)
 # Dead-air filler: seconds after a deep dispatch to nudge the brain to hold the
 # floor (small talk) if the line is quiet. Backs off, then goes silent.
 DEEP_FILLER_AT = [7, 20, 40, 75]
@@ -508,6 +519,124 @@ class Chat:
 CHAT = Chat()
 
 
+# ── phone line (Twilio voice webhooks) ─────────────────────────────────────────
+def _xml(s):
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+             .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def elevenlabs_mp3(text):
+    url = (f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
+           "?optimize_streaming_latency=3&output_format=mp3_44100_64")
+    body = json.dumps({
+        "text": text[:4000],
+        "model_id": "eleven_flash_v2_5",
+        "voice_settings": {"stability": 0.65, "similarity_boost": 0.5,
+                           "use_speaker_boost": True, "speed": 1.15},
+    }).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read()
+
+
+class PhoneLine:
+    """The same one conversation, over a Twilio <Gather> webhook loop.
+
+    Twilio does carrier-side STT (<Gather input="speech">); replies are
+    ElevenLabs mp3s served from an in-memory cache (Plays nested in the Gather,
+    so the caller can barge in). A no-speech Gather timeout redirects back to
+    /voice/turn, which doubles as the poll that relays deep results and
+    dead-air fillers mid-call. Browser tabs mirror the whole call live because
+    it's the same Chat: phone turns broadcast like any other."""
+
+    def __init__(self, chat):
+        self.chat = chat
+        self.spoken_idx = 0     # messages index already spoken down the line
+        self.tts_cache = {}     # id -> mp3 bytes (capped)
+        self.lock = threading.Lock()
+
+    def call_connected(self, params):
+        direction = params.get("Direction", "inbound")
+        who = params.get("To" if direction.startswith("outbound") else "From", "unknown")
+        base = len(self.chat.messages)
+        self.spoken_idx = base  # don't replay pre-call chatter down the line
+        self.chat.messages.append({
+            "role": "user", "kind": "filler",
+            "content": f"[phone] A live phone call just connected ({direction}, "
+                       f"other side: {who}). Greet the caller naturally in one "
+                       "short sentence, like answering the phone."})
+        self.chat._enqueue("turn")
+        self._wait_assistant(base)
+
+    def user_said(self, text):
+        base = len(self.chat.messages)
+        self.chat.on_user(text)
+        self._wait_assistant(base)
+
+    def _wait_assistant(self, base, timeout=12):
+        deadline = time.time() + timeout   # stay under Twilio's 15s webhook cap
+        while time.time() < deadline:
+            if any(m["role"] == "assistant" for m in self.chat.messages[base:]):
+                return True
+            time.sleep(0.15)
+        return False
+
+    def pending_speech(self):
+        with self.lock:
+            msgs = self.chat.messages
+            out = []
+            for m in msgs[self.spoken_idx:]:
+                if m["role"] != "assistant":
+                    continue
+                text = DEEP_TAG.sub("", m["content"]).replace("(interrupted)", "").strip()
+                if text:
+                    out.append(text)
+            self.spoken_idx = len(msgs)
+        return out
+
+    def tts_id(self, text):
+        try:
+            mp3 = elevenlabs_mp3(text)
+        except Exception as e:
+            print(f"[phone] tts failed: {e}", flush=True)
+            return None
+        tid = secrets.token_hex(8)
+        with self.lock:
+            self.tts_cache[tid] = mp3
+            while len(self.tts_cache) > 40:
+                self.tts_cache.pop(next(iter(self.tts_cache)))
+        return tid
+
+    def twiml_reply(self):
+        parts = []
+        for text in self.pending_speech():
+            tid = self.tts_id(text) if ELEVENLABS_API_KEY else None
+            parts.append(f"<Play>/voice/tts/{tid}.mp3</Play>" if tid
+                         else f"<Say>{_xml(text)}</Say>")
+        return ('<?xml version="1.0" encoding="UTF-8"?><Response>'
+                '<Gather input="speech" action="/voice/turn" method="POST" '
+                'speechTimeout="auto" timeout="6">' + "".join(parts) + '</Gather>'
+                '<Redirect method="POST">/voice/turn</Redirect></Response>')
+
+
+PHONE = PhoneLine(CHAT)
+
+
+def place_call(to):
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Calls.json"
+    data = urllib.parse.urlencode({
+        "To": to, "From": CALLER_ID,
+        "Url": f"{PUBLIC_URL}/voice", "Method": "POST"}).encode()
+    auth = base64.b64encode(f"{TWILIO_SID}:{TWILIO_TOKEN}".encode()).decode()
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Authorization": f"Basic {auth}"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
+
+
 # ── HTTP + WS handler ───────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -547,12 +676,99 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_ws()
         if path in ("/", "/index.html"):
             return self._serve_file(HERE / "index.html", "text/html; charset=utf-8")
+        if path.startswith("/voice/tts/"):
+            tid = path.rsplit("/", 1)[-1].removesuffix(".mp3")
+            mp3 = PHONE.tts_cache.get(tid)
+            if not mp3:
+                return self.send_error(404, "not found")
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Length", str(len(mp3)))
+            self.end_headers()
+            return self.wfile.write(mp3)
         self.send_error(404, "not found")
 
     def do_POST(self):
-        if self.path.split("?")[0] == "/tts":
+        path = self.path.split("?")[0]
+        if path == "/tts":
             return self._handle_tts()
+        if path == "/voice":
+            return self._handle_voice(connected=True)
+        if path == "/voice/turn":
+            return self._handle_voice(connected=False)
+        if path == "/call":
+            return self._handle_call()
         self.send_error(404, "not found")
+
+    # -- phone webhooks ----------------------------------------------------------
+    def _form(self):
+        n = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(n).decode("utf-8", errors="replace") if n else ""
+        from urllib.parse import parse_qs
+        return {k: v[0] for k, v in parse_qs(body).items()}
+
+    def _twilio_ok(self, params):
+        if os.environ.get("PHONE_VALIDATE", "1") == "0":
+            return True
+        if not (TWILIO_TOKEN and PUBLIC_URL):
+            return False
+        sig = self.headers.get("X-Twilio-Signature", "")
+        payload = PUBLIC_URL + self.path + "".join(k + params[k] for k in sorted(params))
+        mac = hmac.new(TWILIO_TOKEN.encode(), payload.encode(), hashlib.sha1)
+        return hmac.compare_digest(base64.b64encode(mac.digest()).decode(), sig)
+
+    def _send_twiml(self, xml):
+        data = xml.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/xml")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_voice(self, connected):
+        if not PHONE_AVAILABLE:
+            return self.send_error(503, "phone not configured")
+        params = self._form()
+        if not self._twilio_ok(params):
+            return self.send_error(403, "bad twilio signature")
+        if connected:
+            print(f"[phone] call connected: {params.get('Direction')} "
+                  f"{params.get('From')} -> {params.get('To')}", flush=True)
+            PHONE.call_connected(params)
+        else:
+            speech = (params.get("SpeechResult") or "").strip()
+            if speech:
+                PHONE.user_said(speech)
+        return self._send_twiml(PHONE.twiml_reply())
+
+    def _handle_call(self):
+        if not self._token_ok():
+            return self.send_error(403, "bad token")
+        if not PHONE_AVAILABLE:
+            return self.send_error(503, "phone not configured")
+        if not PUBLIC_URL:
+            return self.send_error(503, "PUBLIC_URL not set — Twilio needs a public webhook URL")
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            to = (json.loads(self.rfile.read(n)).get("to") or "").strip()
+        except Exception:
+            to = ""
+        if not re.fullmatch(r"\+\d{7,15}", to):
+            return self.send_error(400, "to must be E.164, like +19705551234")
+        try:
+            out = place_call(to)
+            print(f"[phone] outbound call placed to {to}: {out.get('sid')}", flush=True)
+            body = json.dumps({"sid": out.get("sid"), "status": out.get("status")}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:300]
+            self.send_error(502, f"twilio {e.code}: {detail}")
+        except Exception as e:
+            self.send_error(502, f"call failed: {e}")
 
     # ElevenLabs streaming proxy — identical shape to the harness one
     def _handle_tts(self):
@@ -697,6 +913,15 @@ def main():
     print(f"  tts        : {'ElevenLabs ' + ELEVENLABS_VOICE_ID if ELEVENLABS_API_KEY else 'browser fallback'}", flush=True)
     print(f"  deep tier  : {'claude-p-agent @ ' + CLAUDE_P_HOME if DEEP_AVAILABLE else 'DISABLED'}"
           f" (cwd {DEEP_CWD})", flush=True)
+    if PHONE_AVAILABLE:
+        print(f"  phone      : Twilio {TWILIO_NUMBER}"
+              + (f", webhooks at {PUBLIC_URL}/voice" if PUBLIC_URL
+                 else " — set PUBLIC_URL (tunnel) for webhooks"), flush=True)
+    else:
+        print("  phone      : not configured (set TWILIO_ACCOUNT_SID/AUTH_TOKEN/NUMBER)",
+              flush=True)
+    if CALL_GOAL:
+        print(f"  call goal  : {CALL_GOAL[:80]}", flush=True)
     srv.serve_forever()
 
 
