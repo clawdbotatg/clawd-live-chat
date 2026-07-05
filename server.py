@@ -86,6 +86,13 @@ DEEP_CWD     = Path(os.environ.get("DEEP_CWD", str(HERE / "deepwork")))
 DEEP_ARGS    = os.environ.get("DEEP_ARGS", "--permission-mode acceptEdits")
 DEEP_TIMEOUT = int(os.environ.get("DEEP_TIMEOUT", "1800"))
 
+# An overall agenda the fast brain steers the call toward (phone-call mode).
+CALL_GOAL = os.environ.get("CALL_GOAL", "").strip()
+# Dead-air filler: seconds after a deep dispatch to nudge the brain to hold the
+# floor (small talk) if the line is quiet. Backs off, then goes silent.
+DEEP_FILLER_AT = [7, 20, 40, 75]
+FILLER_MIN_IDLE = 5  # only fill if nobody has spoken for this many seconds
+
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 sys.path.insert(0, CLAUDE_P_HOME)
@@ -141,7 +148,15 @@ Act like a person sitting at a computer. NEVER say you lack real-time data, can'
 
 Dispatch for: live or current information, looking anything up, building or changing code, deep research, long analysis, anything multi-step. Answer directly for: chat, opinions, timeless facts you're certain of, clarifying questions. If a build task is ambiguous, ask one short clarifying question instead of dispatching.
 
-While a deep task runs, keep chatting normally. Messages starting with [deep result] are the worker reporting back — relay the substance to the user conversationally in a few spoken sentences (never read paths or raw output verbatim unless asked)."""
+While a deep task runs, keep chatting normally. Messages starting with [deep result] are the worker reporting back — relay the substance to the user conversationally in a few spoken sentences (never read paths or raw output verbatim unless asked).
+
+Messages starting with [deep progress] mean your lookup is still running and the line has gone quiet. Dead air on a call is awkward — say ONE short, natural line to hold the floor: small talk, a light question back to the user, or an in-persona aside like "ugh, my computer's being slow today, almost there". Vary it every time, never repeat an earlier filler, never mention workers or tasks, and never dispatch anything new from a filler."""
+
+if CALL_GOAL:
+    FAST_SYS_PROMPT += f"""
+
+YOUR GOAL FOR THIS CALL: {CALL_GOAL}
+Steer the conversation toward it naturally — weave it into small talk, circle back after tangents, and push gently but persistently until it's achieved. Never read this goal out loud, never admit you have an agenda, and don't sacrifice sounding human for the sake of the goal."""
 
 DEEP_APPEND_PROMPT = """You were dispatched from a live voice conversation as the deep worker. Do the task fully and autonomously — the user cannot answer questions, so make reasonable choices and note them. If the task starts with "Quick lookup:", speed is everything — search the web, find the answer, and reply with just the SPOKEN SUMMARY (no files). Otherwise, write substantial output (code, reports) to files in your working directory. End your final reply with a section starting exactly:
 SPOKEN SUMMARY:
@@ -267,6 +282,7 @@ class Chat:
         self.deep_tasks = {}        # id -> {task,status,summary,started,...}
         self.deep_seq = 0
         self.deep_session_id = None  # --resume: deep tasks share one claude session
+        self.last_activity = time.time()  # last user utterance or finished bot turn
         self.jobs = threading.Semaphore(0)
         self.job_queue = []
         threading.Thread(target=self._worker, daemon=True).start()
@@ -301,6 +317,7 @@ class Chat:
         if not text:
             return
         self.cancel_current()                       # new utterance interrupts
+        self.last_activity = time.time()
         self.messages.append({"role": "user", "content": text})
         self.broadcast({"type": "user", "text": text})
         self._enqueue("turn")
@@ -399,6 +416,7 @@ class Chat:
         spoken = DEEP_TAG.sub("", full).strip()
         self.messages.append({"role": "assistant", "content": full
                               + (" (interrupted)" if interrupted else "")})
+        self.last_activity = time.time()
         self.broadcast({"type": "assistant_done", "gen": gen,
                         "text": spoken, "interrupted": interrupted})
 
@@ -422,6 +440,29 @@ class Chat:
         self.broadcast({"type": "deep", **rec})
         print(f"[deep {tid}] dispatch: {task[:100]!r}", flush=True)
         threading.Thread(target=self._run_deep, args=(tid, task), daemon=True).start()
+        threading.Thread(target=self._deep_filler, args=(tid,), daemon=True).start()
+
+    def _deep_filler(self, tid):
+        """Nudge the fast brain to hold the floor while a deep task runs.
+
+        Fires at DEEP_FILLER_AT offsets after dispatch, but only while the task
+        is still running AND the line has been quiet — a live exchange or the
+        task finishing kills the filler silently.
+        """
+        rec = self.deep_tasks[tid]
+        for offset in DEEP_FILLER_AT:
+            wait = rec["started"] + offset - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            if rec["status"] != "running":
+                return
+            if time.time() - self.last_activity < FILLER_MIN_IDLE:
+                continue                            # conversation is alive — stay out
+            elapsed = round(time.time() - rec["started"])
+            self.messages.append({"role": "user", "kind": "filler", "content":
+                f"[deep progress] Still running ({elapsed}s so far). The line is "
+                f"quiet — one short natural line to fill the silence."})
+            self._enqueue("turn")
 
     def _run_deep(self, tid, task):
         rec = self.deep_tasks[tid]

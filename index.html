@@ -338,7 +338,7 @@ function connect() {
       ttsEnabled = m.tts;
       chatEl.innerHTML = "";
       for (const h of m.history || []) {
-        if (h.kind === "deep") continue;                    // deep results shown as cards
+        if (h.kind === "deep" || h.kind === "filler") continue;  // internal, not bubbles
         if (h.role === "user") addBubble("me", h.content);
         else addBubble("bot", h.content.replace(/\[\[\s*DEEP:[\s\S]*?\]\]/g, "").trim());
       }
