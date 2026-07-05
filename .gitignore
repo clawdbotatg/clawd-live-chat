@@ -1,4 +1,6 @@
 .clawd-live-chat.token
 .clawd-live-chat.env
+.clawd-live-chat.cert.pem
+.clawd-live-chat.key.pem
 deepwork/
 __pycache__/

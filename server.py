@@ -59,6 +59,14 @@ _load_env_file(Path.home() / "clawd-harness" / ".clawd-harness.env")
 # generic PORT=8787, which would collide here.
 PORT = int(os.environ.get("CHAT_PORT", "8790"))   # 8787 harness, 8788 slop-circle
 BIND = os.environ.get("CHAT_BIND", "127.0.0.1")
+# TLS: the mic (Web Speech / getUserMedia) only works in a secure context, so a
+# LAN bind is useless over plain http. On a non-loopback bind we self-sign a
+# cert at boot (browser shows a one-time warning; after "proceed" the page IS a
+# secure context and the mic works). CHAT_TLS=0 forces it off, =1 forces it on.
+_tls_env = os.environ.get("CHAT_TLS", "")
+USE_TLS = (_tls_env == "1") if _tls_env in ("0", "1") else BIND not in ("127.0.0.1", "localhost", "::1")
+CERT_FILE = HERE / ".clawd-live-chat.cert.pem"
+KEY_FILE  = HERE / ".clawd-live-chat.key.pem"
 
 # Fast brain (OpenAI-compatible gateway; bankr auth = X-API-Key)
 BANKR_API_KEY  = os.environ.get("BANKR_API_KEY", "")
@@ -608,14 +616,39 @@ class ThreadingHTTPServer(ThreadingMixIn, TCPServer):
     allow_reuse_address = True
 
 
+def _ensure_cert():
+    """Self-sign a cert (openssl CLI, present on macOS) with the LAN IP in the
+    SAN so the browser's 'proceed anyway' sticks. Regenerate by deleting it."""
+    if CERT_FILE.exists() and KEY_FILE.exists():
+        return
+    import subprocess
+    ip = lan_ip()
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", str(KEY_FILE), "-out", str(CERT_FILE),
+         "-days", "825", "-subj", "/CN=clawd-live-chat",
+         "-addext", f"subjectAltName=IP:{ip},IP:127.0.0.1,DNS:localhost"],
+        check=True, capture_output=True)
+    print(f"[tls] self-signed cert generated for {ip}", flush=True)
+
+
 def main():
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
+    scheme = "http"
+    if USE_TLS:
+        import ssl
+        _ensure_cert()
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(CERT_FILE), str(KEY_FILE))
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        scheme = "https"
     q = f"?t={TOKEN}" if AUTH_REQUIRED else ""
-    print(f"clawd-live-chat on http://{BIND}:{PORT}/{q}", flush=True)
+    print(f"clawd-live-chat on {scheme}://{BIND}:{PORT}/{q}", flush=True)
     if AUTH_REQUIRED:
-        print(f"  LAN: http://{lan_ip()}:{PORT}/?t={TOKEN}", flush=True)
-        print("  NOTE: Web Speech + mic need a secure context — use localhost "
-              "or put TLS in front for phones.", flush=True)
+        print(f"  LAN: {scheme}://{lan_ip()}:{PORT}/?t={TOKEN}", flush=True)
+        if not USE_TLS:
+            print("  NOTE: mic needs a secure context — plain http over LAN "
+                  "will be text-only.", flush=True)
     print(f"  fast brain : {FAST_MODEL} via {BANKR_BASE_URL} "
           f"({'keyed' if BANKR_API_KEY else 'NO KEY — chat will fail'})", flush=True)
     print(f"  tts        : {'ElevenLabs ' + ELEVENLABS_VOICE_ID if ELEVENLABS_API_KEY else 'browser fallback'}", flush=True)
