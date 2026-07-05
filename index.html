@@ -252,8 +252,12 @@ function looksLikeEcho(text) {
   if (recentSpoken.includes(n)) return true;
   const words = n.split(" ");
   if (words.length < 2) return false;
-  const hit = words.filter(w => recentSpoken.includes(w)).length;
-  return hit / words.length > 0.8;
+  // An echo repeats our word ORDER — match consecutive pairs, not lone common
+  // words ("the", "what", "it"), which false-flag real interruptions.
+  let hit = 0;
+  for (let i = 0; i < words.length - 1; i++)
+    if (recentSpoken.includes(words[i] + " " + words[i + 1])) hit++;
+  return hit / (words.length - 1) > 0.6;
 }
 
 // ── speech recognition (Web Speech API) ──────────────────────────────────────
@@ -272,9 +276,12 @@ function makeRec() {
       else interim += t;
     }
     if (interim.trim()) {
-      interimEl.textContent = "… " + interim.trim();
+      const t = interim.trim();
+      interimEl.textContent = "… " + t;
+      // explicit interrupt words barge in instantly, even as a single word
+      const cmd = /^(stop|wait|hold on|hang on|shut up|pause|quiet|never ?mind)\b/i.test(t);
       // user talking over the bot → barge in (unless it's our own voice echoing)
-      if (playing && interim.trim().split(/\s+/).length >= 2 && !looksLikeEcho(interim)) {
+      if (playing && (cmd || t.split(/\s+/).length >= 2) && !looksLikeEcho(t)) {
         bargeIn();
       }
     }
@@ -286,7 +293,7 @@ function makeRec() {
       sendUser(text);
     }
   };
-  r.onend = () => { recAlive = false; if (micOn) setTimeout(startRec, 250); };
+  r.onend = () => { recAlive = false; if (micOn) setTimeout(startRec, 80); };
   r.onerror = e => {
     recAlive = false;
     if (e.error === "not-allowed") {
