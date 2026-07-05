@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>clawd live chat</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦞</text></svg>">
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #131824; --ink: #dde3ee; --dim: #7a8499;
+    --me: #1d4ed8; --bot: #1c2333; --accent: #34d399; --warn: #fbbf24; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    background: var(--panel); border-bottom: 1px solid #222a3d; flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .03em; }
+  #pill {
+    font-size: 12px; padding: 2px 10px; border-radius: 999px;
+    background: #222a3d; color: var(--dim); transition: all .2s;
+  }
+  #pill.listening { background: #0f2b22; color: var(--accent); }
+  #pill.thinking  { background: #2b230f; color: var(--warn); }
+  #pill.speaking  { background: #16233d; color: #93b4f8; }
+  #deepbar { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+  .deepchip {
+    font-size: 11px; padding: 3px 9px; border-radius: 999px; max-width: 260px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    border: 1px solid #2b3550; color: var(--dim); cursor: default;
+  }
+  .deepchip.running { border-color: var(--warn); color: var(--warn); animation: pulse 1.6s infinite; }
+  .deepchip.done    { border-color: var(--accent); color: var(--accent); }
+  .deepchip.error   { border-color: var(--err); color: var(--err); }
+  @keyframes pulse { 50% { opacity: .45; } }
+  #reset { background: none; border: 1px solid #2b3550; color: var(--dim);
+           border-radius: 8px; font-size: 11px; padding: 3px 9px; cursor: pointer; }
+
+  #chat { flex: 1; overflow-y: auto; padding: 16px 12px 8px; scroll-behavior: smooth; }
+  .row { display: flex; margin: 6px 0; }
+  .bubble {
+    max-width: 78%; padding: 9px 13px; border-radius: 16px;
+    white-space: pre-wrap; word-wrap: break-word;
+  }
+  .row.me { justify-content: flex-end; }
+  .row.me .bubble { background: var(--me); border-bottom-right-radius: 4px; }
+  .row.bot .bubble { background: var(--bot); border-bottom-left-radius: 4px; }
+  .row.bot .bubble.interrupted { opacity: .6; }
+  .row.deep { justify-content: center; }
+  .row.deep .card {
+    max-width: 88%; font-size: 13px; color: var(--dim);
+    border: 1px dashed #2b3550; border-radius: 12px; padding: 8px 12px;
+  }
+  .row.deep .card b { color: var(--accent); font-weight: 600; }
+  .row.deep .card.error b { color: var(--err); }
+  #interim { color: var(--dim); font-style: italic; padding: 0 16px 6px; min-height: 22px; font-size: 14px; }
+
+  footer {
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px 14px;
+    background: var(--panel); border-top: 1px solid #222a3d;
+  }
+  #orb {
+    width: 52px; height: 52px; border-radius: 50%; border: none; cursor: pointer;
+    background: radial-gradient(circle at 35% 30%, #2dd4a0, #0d7a56);
+    flex: none; transition: all .2s; position: relative;
+  }
+  #orb.off { background: #2b3550; }
+  #orb.speaking { box-shadow: 0 0 22px #4c7dff88; }
+  #orb.listening { box-shadow: 0 0 18px #34d39966; animation: breathe 2.4s infinite; }
+  @keyframes breathe { 50% { box-shadow: 0 0 34px #34d399aa; } }
+  #box {
+    flex: 1; background: #0e1320; color: var(--ink); border: 1px solid #2b3550;
+    border-radius: 12px; padding: 11px 13px; font-size: 16px; outline: none;
+  }
+  #overlay {
+    position: fixed; inset: 0; background: #0b0e14ee; display: flex;
+    flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+    z-index: 10; cursor: pointer;
+  }
+  #overlay .big { font-size: 22px; font-weight: 600; }
+  #overlay .sub { color: var(--dim); font-size: 14px; max-width: 420px; text-align: center; padding: 0 20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🦞 clawd live</h1>
+  <span id="pill">connecting…</span>
+  <div id="deepbar"></div>
+  <button id="reset" title="clear conversation">reset</button>
+</header>
+<div id="chat"></div>
+<div id="interim"></div>
+<footer>
+  <button id="orb" class="off" title="toggle mic"></button>
+  <input id="box" placeholder="or type here…" autocomplete="off">
+</footer>
+<div id="overlay">
+  <div class="big">🦞 tap to talk</div>
+  <div class="sub">Open mic with barge-in — start talking any time, even while it's
+    speaking. Deep work gets dispatched to a real Claude Code agent and reported
+    back into the conversation.</div>
+</div>
+
+<script>
+"use strict";
+const qs = new URLSearchParams(location.search);
+const TOKEN = qs.get("t") || "";
+const tok = TOKEN ? `?t=${encodeURIComponent(TOKEN)}` : "";
+
+const chatEl = document.getElementById("chat");
+const pill = document.getElementById("pill");
+const interimEl = document.getElementById("interim");
+const orb = document.getElementById("orb");
+const box = document.getElementById("box");
+const deepbar = document.getElementById("deepbar");
+const overlay = document.getElementById("overlay");
+
+let ws = null, ttsEnabled = false;
+let micOn = false, rec = null, recAlive = false;
+
+// ── chat rendering ───────────────────────────────────────────────────────────
+function scrollDown() { chatEl.scrollTop = chatEl.scrollHeight; }
+function addBubble(cls, text) {
+  const row = document.createElement("div");
+  row.className = "row " + cls;
+  const b = document.createElement("div");
+  b.className = "bubble";
+  b.textContent = text;
+  row.appendChild(b);
+  chatEl.appendChild(row);
+  scrollDown();
+  return b;
+}
+function addDeepCard(rec) {
+  const row = document.createElement("div");
+  row.className = "row deep";
+  const c = document.createElement("div");
+  c.className = "card" + (rec.status === "error" ? " error" : "");
+  const label = rec.status === "running" ? "deep task started"
+              : rec.status === "done" ? `deep task done (${rec.elapsed || "?"}s)`
+              : "deep task failed";
+  c.innerHTML = `<b>${label}</b> — `;
+  c.appendChild(document.createTextNode(rec.task));
+  row.appendChild(c);
+  chatEl.appendChild(row);
+  scrollDown();
+}
+
+function setPill(state, label) {
+  pill.className = state;
+  pill.textContent = label;
+}
+function refreshPill() {
+  if (playing) setPill("speaking", "speaking");
+  else if (genWaiting) setPill("thinking", "thinking");
+  else if (micOn) setPill("listening", "listening");
+  else setPill("", "idle");
+}
+let genWaiting = false;
+
+// ── deep chips ───────────────────────────────────────────────────────────────
+const deepChips = {};
+function upsertDeep(rec) {
+  let chip = deepChips[rec.id];
+  if (!chip) {
+    chip = document.createElement("span");
+    deepChips[rec.id] = chip;
+    deepbar.appendChild(chip);
+  }
+  chip.className = "deepchip " + rec.status;
+  chip.title = rec.task + (rec.summary ? "\n\n" + rec.summary : "");
+  chip.textContent = (rec.status === "running" ? "⏳ " : rec.status === "done" ? "✓ " : "✗ ")
+                   + rec.task.slice(0, 40);
+}
+
+// ── audio pipeline: speak-messages → /tts fetch → ordered playback ───────────
+let audioQueue = [];        // {gen, seq, blobPromise, text}
+let playing = false;
+let currentAudio = null;
+let liveGen = 0;            // latest generation; older gens' audio is dropped
+let cancelledGens = new Set();
+let recentSpoken = "";      // echo guard corpus
+
+function norm(s) { return s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim(); }
+
+function enqueueSpeech(msg) {
+  if (!ttsEnabled) { webSpeechFallback(msg.text); return; }
+  const blobPromise = fetch("/tts" + tok, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: msg.text }),
+  }).then(r => r.ok ? r.blob() : null).catch(() => null);
+  audioQueue.push({ gen: msg.gen, seq: msg.seq, blobPromise, text: msg.text });
+  pumpAudio();
+}
+
+async function pumpAudio() {
+  if (playing) return;
+  playing = true;
+  refreshPill();
+  while (audioQueue.length) {
+    const item = audioQueue.shift();
+    if (item.gen !== liveGen || cancelledGens.has(item.gen)) continue;
+    const blob = await item.blobPromise;
+    if (!blob || item.gen !== liveGen || cancelledGens.has(item.gen)) continue;
+    recentSpoken = (recentSpoken + " " + norm(item.text)).slice(-600);
+    const url = URL.createObjectURL(blob);
+    await new Promise(res => {
+      currentAudio = new Audio(url);
+      currentAudio.onended = res;
+      currentAudio.onerror = res;
+      currentAudio.play().catch(res);
+    });
+    URL.revokeObjectURL(url);
+    currentAudio = null;
+  }
+  playing = false;
+  refreshPill();
+}
+
+function stopAudio() {
+  audioQueue = [];
+  if (currentAudio) { try { currentAudio.pause(); } catch (e) {} currentAudio = null; }
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+}
+
+function webSpeechFallback(text) {
+  if (!("speechSynthesis" in window)) return;
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1.1;
+  speechSynthesis.speak(u);
+}
+
+// ── barge-in ─────────────────────────────────────────────────────────────────
+function bargeIn() {
+  cancelledGens.add(liveGen);
+  stopAudio();
+  send({ type: "cancel" });
+  playing = false;
+  refreshPill();
+}
+function looksLikeEcho(text) {
+  const n = norm(text);
+  if (!n) return true;
+  if (recentSpoken.includes(n)) return true;
+  const words = n.split(" ");
+  if (words.length < 2) return false;
+  const hit = words.filter(w => recentSpoken.includes(w)).length;
+  return hit / words.length > 0.8;
+}
+
+// ── speech recognition (Web Speech API) ──────────────────────────────────────
+function makeRec() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { interimEl.textContent = "⚠ no Web Speech API in this browser — type instead"; return null; }
+  const r = new SR();
+  r.continuous = true;
+  r.interimResults = true;
+  r.lang = "en-US";
+  r.onresult = ev => {
+    let interim = "", finals = "";
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const t = ev.results[i][0].transcript;
+      if (ev.results[i].isFinal) finals += t;
+      else interim += t;
+    }
+    if (interim.trim()) {
+      interimEl.textContent = "… " + interim.trim();
+      // user talking over the bot → barge in (unless it's our own voice echoing)
+      if (playing && interim.trim().split(/\s+/).length >= 2 && !looksLikeEcho(interim)) {
+        bargeIn();
+      }
+    }
+    if (finals.trim()) {
+      interimEl.textContent = "";
+      const text = finals.trim();
+      if ((playing || genRecently()) && looksLikeEcho(text)) return;  // self-echo
+      if (playing) bargeIn();
+      sendUser(text);
+    }
+  };
+  r.onend = () => { recAlive = false; if (micOn) setTimeout(startRec, 250); };
+  r.onerror = e => {
+    recAlive = false;
+    if (e.error === "not-allowed") {
+      micOn = false; orb.className = "off";
+      interimEl.textContent = "⚠ mic permission denied — type instead";
+    }
+  };
+  return r;
+}
+let lastAudioEnd = 0;
+function genRecently() { return Date.now() - lastAudioEnd < 1200; }
+
+function startRec() {
+  if (!rec) rec = makeRec();
+  if (!rec || recAlive) return;
+  try { rec.start(); recAlive = true; } catch (e) {}
+  refreshPill();
+}
+function stopRec() {
+  if (rec && recAlive) try { rec.stop(); } catch (e) {}
+  recAlive = false;
+  refreshPill();
+}
+
+orb.onclick = () => {
+  micOn = !micOn;
+  orb.className = micOn ? "listening" : "off";
+  if (micOn) startRec(); else stopRec();
+  refreshPill();
+};
+
+// ── websocket ────────────────────────────────────────────────────────────────
+let curBotBubble = null;
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws${tok}`);
+  ws.onopen = () => refreshPill();
+  ws.onclose = () => { setPill("", "reconnecting…"); setTimeout(connect, 1200); };
+  ws.onmessage = ev => {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.type === "init") {
+      ttsEnabled = m.tts;
+      chatEl.innerHTML = "";
+      for (const h of m.history || []) {
+        if (h.kind === "deep") continue;                    // deep results shown as cards
+        if (h.role === "user") addBubble("me", h.content);
+        else addBubble("bot", h.content.replace(/\[\[\s*DEEP:[\s\S]*?\]\]/g, "").trim());
+      }
+      for (const d of m.deep || []) upsertDeep(d);
+      if (!m.deepAvailable) interimEl.textContent = "⚠ deep tier disabled on server";
+      refreshPill();
+    } else if (m.type === "user") {
+      addBubble("me", m.text);
+    } else if (m.type === "assistant_start") {
+      liveGen = m.gen;
+      genWaiting = true;
+      curBotBubble = addBubble("bot", "");
+      refreshPill();
+    } else if (m.type === "delta") {
+      if (m.gen !== liveGen || !curBotBubble) return;
+      curBotBubble.textContent =
+        (curBotBubble.textContent + m.text).replace(/\[\[\s*DEEP:[\s\S]*$/, "");
+      scrollDown();
+    } else if (m.type === "speak") {
+      if (m.gen === liveGen && !cancelledGens.has(m.gen)) enqueueSpeech(m);
+    } else if (m.type === "assistant_done") {
+      genWaiting = false;
+      if (curBotBubble) {
+        curBotBubble.textContent = m.text;
+        if (m.interrupted) curBotBubble.classList.add("interrupted");
+        curBotBubble = null;
+      }
+      lastAudioEnd = Date.now() + 800;
+      refreshPill();
+    } else if (m.type === "deep") {
+      upsertDeep(m);
+      addDeepCard(m);
+    } else if (m.type === "error") {
+      addBubble("bot", "⚠ " + m.text).style.color = "#f87171";
+    } else if (m.type === "resetDone") {
+      chatEl.innerHTML = "";
+    }
+  };
+}
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+function sendUser(text) {
+  cancelledGens.add(liveGen);   // any in-flight speech is now stale
+  stopAudio();
+  send({ type: "user", text });
+}
+
+box.addEventListener("keydown", e => {
+  if (e.key === "Enter" && box.value.trim()) {
+    sendUser(box.value.trim());
+    box.value = "";
+  }
+});
+document.getElementById("reset").onclick = () => {
+  if (confirm("Clear the whole conversation?")) send({ type: "reset" });
+};
+
+// tap-to-start: satisfies mic-permission + audio-autoplay gestures in one go
+overlay.onclick = () => {
+  overlay.remove();
+  const a = new Audio("data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAACAAABhgC7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7v///////////////////////////////////////////8AAAAATGF2YzU4LjEzAAAAAAAAAAAAAAAAJAAAAAAAAAAAAYYoRBqpAAAAAAD/+xDEAAPAAAGkAAAAIAAANIAAAARMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV");
+  a.play().catch(() => {});
+  micOn = true;
+  orb.className = "listening";
+  startRec();
+};
+
+connect();
+</script>
+</body>
+</html>
