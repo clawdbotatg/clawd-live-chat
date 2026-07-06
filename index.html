@@ -40,28 +40,30 @@
   .deepchip.done    { border-color: var(--accent); color: var(--accent); }
   .deepchip.error   { border-color: var(--err); color: var(--err); }
   @keyframes pulse { 50% { opacity: .45; } }
-  #reset, #callToggle { background: none; border: 1px solid #2b3550; color: var(--dim);
-           border-radius: 8px; font-size: 11px; padding: 3px 9px; cursor: pointer; }
-  #callToggle.active { border-color: var(--accent); color: var(--accent); }
-  #callbar {
+  #reset, #callToggle, #textToggle { background: none; border: 1px solid #2b3550;
+           color: var(--dim); border-radius: 8px; font-size: 11px; padding: 3px 9px; cursor: pointer; }
+  #callToggle.active, #textToggle.active { border-color: var(--accent); color: var(--accent); }
+  #callbar, #textbar {
     display: none; gap: 8px; padding: 10px 14px; background: var(--panel);
     border-bottom: 1px solid #222a3d; flex-wrap: wrap; align-items: center;
   }
-  #callbar.open { display: flex; }
-  #callbar input {
+  #callbar.open, #textbar.open { display: flex; }
+  #callbar input, #textbar input {
     background: var(--bg); border: 1px solid #2b3550; color: var(--ink);
     border-radius: 8px; padding: 7px 10px; font-size: 13px; font-family: inherit;
   }
-  #callNum { width: 150px; }
-  #callGoal { flex: 1; min-width: 200px; }
-  #callGo {
+  #callNum, #textNum { width: 150px; }
+  #callGoal, #textGoal { flex: 1; min-width: 200px; }
+  #callGo, #textGo {
     background: var(--accent); border: none; color: #04120c; font-weight: 600;
     border-radius: 8px; padding: 7px 16px; font-size: 13px; cursor: pointer;
   }
-  #callGo:disabled { opacity: .5; cursor: default; }
-  #callStatus { font-size: 12px; color: var(--dim); width: 100%; }
-  #callStatus.err { color: var(--err); }
-  #callStatus.ok { color: var(--accent); }
+  #callGo:disabled, #textGo:disabled { opacity: .5; cursor: default; }
+  #callStatus, #textStatus { font-size: 12px; color: var(--dim); width: 100%; }
+  #callStatus.err, #textStatus.err { color: var(--err); }
+  #callStatus.ok, #textStatus.ok { color: var(--accent); }
+  .bubble.sms { border: 1px dashed #3a4560; }
+  .smstag { font-size: 10px; color: var(--dim); margin-bottom: 3px; letter-spacing: .03em; }
 
   #chat { flex: 1; overflow-y: auto; padding: 16px 12px 8px; scroll-behavior: smooth; }
   .row { display: flex; margin: 6px 0; }
@@ -114,6 +116,7 @@
   <span id="pill">connecting…</span>
   <div id="deepbar"></div>
   <button id="callToggle" title="place an outbound call">📞 call</button>
+  <button id="textToggle" title="start a text negotiation">💬 text</button>
   <button id="reset" title="clear conversation">reset</button>
 </header>
 <div id="callbar">
@@ -121,6 +124,12 @@
   <input id="callGoal" placeholder="her mission on this call (e.g. order a large cheese pizza to 123 Main St, pay cash)" autocomplete="off">
   <button id="callGo">call</button>
   <div id="callStatus"></div>
+</div>
+<div id="textbar">
+  <input id="textNum" placeholder="+19705551234" autocomplete="off">
+  <input id="textGoal" placeholder="what to negotiate over text (e.g. talk them down to $200 for the couch)" autocomplete="off">
+  <button id="textGo">text</button>
+  <div id="textStatus"></div>
 </div>
 <div id="chat"></div>
 <div id="interim"></div>
@@ -164,6 +173,20 @@ function addBubble(cls, text) {
   chatEl.appendChild(row);
   scrollDown();
   return b;
+}
+function addSms(m) {
+  const row = document.createElement("div");
+  row.className = "row " + (m.dir === "in" ? "bot" : "me");
+  const b = document.createElement("div");
+  b.className = "bubble sms";
+  const tag = document.createElement("div");
+  tag.className = "smstag";
+  tag.textContent = "💬 " + m.number + (m.dir === "in" ? " → her" : " ← her");
+  b.appendChild(tag);
+  b.appendChild(document.createTextNode(m.text));
+  row.appendChild(b);
+  chatEl.appendChild(row);
+  scrollDown();
 }
 function addDeepCard(rec) {
   const row = document.createElement("div");
@@ -398,6 +421,8 @@ function connect() {
     } else if (m.type === "deep") {
       upsertDeep(m);
       addDeepCard(m);
+    } else if (m.type === "sms") {
+      addSms(m);
     } else if (m.type === "error") {
       addBubble("bot", "⚠ " + m.text).style.color = "#f87171";
     } else if (m.type === "resetDone") {
@@ -465,6 +490,54 @@ async function placeCall() {
 callGo.onclick = placeCall;
 callGoal.addEventListener("keydown", e => { if (e.key === "Enter") placeCall(); });
 callNum.addEventListener("keydown", e => { if (e.key === "Enter") callGoal.focus(); });
+
+// ── outbound text launcher ────────────────────────────────────────────────────
+const textToggle = document.getElementById("textToggle");
+const textbar = document.getElementById("textbar");
+const textNum = document.getElementById("textNum");
+const textGoal = document.getElementById("textGoal");
+const textGo = document.getElementById("textGo");
+const textStatus = document.getElementById("textStatus");
+
+textToggle.onclick = () => {
+  const open = textbar.classList.toggle("open");
+  textToggle.classList.toggle("active", open);
+  if (open) textNum.focus();
+};
+async function startText() {
+  const to = textNum.value.trim().replace(/[()\s.-]/g, "");
+  const goal = textGoal.value.trim();
+  if (!/^\+\d{7,15}$/.test(to)) {
+    textStatus.textContent = "number must be E.164, like +19705551234";
+    textStatus.className = "err";
+    return;
+  }
+  textGo.disabled = true;
+  textStatus.textContent = "texting " + to + "…";
+  textStatus.className = "";
+  try {
+    const r = await fetch("/text" + tok, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ to, goal }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) {
+      textStatus.textContent = "sent to " + to + " — replies appear below as they come in";
+      textStatus.className = "ok";
+    } else {
+      textStatus.textContent = "text failed: " + (j.error || r.status);
+      textStatus.className = "err";
+    }
+  } catch (e) {
+    textStatus.textContent = "text failed: " + e.message;
+    textStatus.className = "err";
+  }
+  textGo.disabled = false;
+}
+textGo.onclick = startText;
+textGoal.addEventListener("keydown", e => { if (e.key === "Enter") startText(); });
+textNum.addEventListener("keydown", e => { if (e.key === "Enter") textGoal.focus(); });
 
 // tap-to-start: satisfies mic-permission + audio-autoplay gestures in one go
 overlay.onclick = () => {

@@ -169,6 +169,16 @@ if CALL_GOAL:
 YOUR GOAL FOR THIS CALL: {CALL_GOAL}
 Steer the conversation toward it naturally — weave it into small talk, circle back after tangents, and push gently but persistently until it's achieved. Never read this goal out loud, never admit you have an agenda, and don't sacrifice sounding human for the sake of the goal."""
 
+SMS_SYS_PROMPT = """You are Claudia, a REAL PERSON in Fort Collins, Colorado, texting from your phone. You are texting a real person — you are NOT an AI and never say otherwise.
+
+Texting rules:
+- Write like a real person texts: short, casual, lowercase is fine, contractions, one or two messages worth. No markdown, no bullet points, no essays.
+- One thought per text. If you'd say a lot, send the most important part.
+- It's fine to be brief — "sounds good" or "what time?" is a complete text.
+- Never mention being an assistant, AI, model, or bot. You have a life, you're a person.
+
+You are texting toward a specific OBJECTIVE (below). Negotiate naturally and persistently: be friendly, make your case, counter-offer, and keep steering back to what you want without being pushy or robotic. Don't cave immediately and don't reveal you have an explicit goal. When the objective is genuinely settled (they agree, or it's clearly dead), wrap up warmly."""
+
 DEEP_APPEND_PROMPT = """You were dispatched from a live voice conversation as the deep worker. Do the task fully and autonomously — the user cannot answer questions, so make reasonable choices and note them. If the task starts with "Quick lookup:", speed is everything — search the web, find the answer, and reply with just the SPOKEN SUMMARY (no files). Otherwise, write substantial output (code, reports) to files in your working directory. End your final reply with a section starting exactly:
 SPOKEN SUMMARY:
 followed by two to four short plain-prose sentences (no markdown) that a voice assistant will read aloud, mentioning where any files landed."""
@@ -649,6 +659,107 @@ def place_call(to):
         return json.loads(r.read())
 
 
+# ── SMS negotiation (Twilio Messaging) ─────────────────────────────────────────
+def bankr_complete(messages, max_tokens=300, temperature=0.8):
+    """One non-streaming completion via the Bankr gateway."""
+    body = {"model": FAST_MODEL, "stream": False, "max_tokens": max_tokens,
+            "temperature": temperature, "messages": messages}
+    if BANKR_API == "bankr":
+        headers = {"X-API-Key": BANKR_API_KEY, "content-type": "application/json"}
+    else:
+        headers = {"Authorization": f"Bearer {BANKR_API_KEY}",
+                   "content-type": "application/json"}
+    req = urllib.request.Request(f"{BANKR_BASE_URL}/chat/completions",
+                                 data=json.dumps(body).encode(),
+                                 headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        d = json.loads(resp.read())
+    return (d["choices"][0]["message"]["content"] or "").strip()
+
+
+class SmsAgent:
+    """Per-contact text threads. Each number gets its own conversation and
+    optional negotiation goal. Same Claudia persona, texting instead of talking.
+    Threads mirror to the browser as `sms` events for monitoring."""
+
+    def __init__(self, chat):
+        self.chat = chat
+        self.threads = {}    # number -> [{role, content}]
+        self.goals = {}      # number -> objective string
+        self.lock = threading.Lock()
+
+    def _sys(self, number):
+        p = SMS_SYS_PROMPT
+        goal = self.goals.get(number)
+        if goal:
+            p += f"\n\nYOUR OBJECTIVE IN THIS TEXT THREAD: {goal}"
+        return p
+
+    def _reply(self, number):
+        with self.lock:
+            history = list(self.threads.get(number, []))
+        msgs = [{"role": "system", "content": self._sys(number)}] + history
+        try:
+            text = bankr_complete(msgs)[:1500]
+        except Exception as e:
+            print(f"[sms] brain error: {e}", flush=True)
+            text = ""
+        return text
+
+    def handle_inbound(self, number, body):
+        with self.lock:
+            self.threads.setdefault(number, []).append(
+                {"role": "user", "content": body})
+        self.chat.broadcast({"type": "sms", "dir": "in", "number": number,
+                             "text": body})
+        print(f"[sms] {number} -> {body[:80]!r}", flush=True)
+        reply = self._reply(number)
+        if reply:
+            with self.lock:
+                self.threads[number].append({"role": "assistant", "content": reply})
+            self.chat.broadcast({"type": "sms", "dir": "out", "number": number,
+                                 "text": reply})
+            print(f"[sms] {number} <- {reply[:80]!r}", flush=True)
+        return reply
+
+    def start_thread(self, number, goal):
+        with self.lock:
+            self.threads[number] = []
+            if goal:
+                self.goals[number] = goal
+        # seed with the objective so she opens the conversation herself
+        with self.lock:
+            self.threads[number].append({"role": "user", "content":
+                f"[system] Start a NEW text conversation with this person to achieve "
+                f"your objective. Send a natural, friendly opening text — like a real "
+                f"person reaching out. Objective: {goal or 'just say hi'}"})
+        opener = self._reply(number)
+        with self.lock:
+            # drop the system seed, keep only the real opening text as history
+            self.threads[number] = ([{"role": "assistant", "content": opener}]
+                                    if opener else [])
+        if opener:
+            send_sms(number, opener)
+            self.chat.broadcast({"type": "sms", "dir": "out", "number": number,
+                                 "text": opener})
+            print(f"[sms] opened {number} <- {opener[:80]!r}", flush=True)
+        return opener
+
+
+def send_sms(to, body):
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json"
+    data = urllib.parse.urlencode({"To": to, "From": TWILIO_NUMBER,
+                                   "Body": body}).encode()
+    auth = base64.b64encode(f"{TWILIO_SID}:{TWILIO_TOKEN}".encode()).decode()
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Authorization": f"Basic {auth}"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
+
+
+SMS = SmsAgent(CHAT)
+
+
 # ── HTTP + WS handler ───────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -710,6 +821,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_voice(connected=False)
         if path == "/call":
             return self._handle_call()
+        if path == "/sms":
+            return self._handle_sms()
+        if path == "/text":
+            return self._handle_text()
         self.send_error(404, "not found")
 
     # -- phone webhooks ----------------------------------------------------------
@@ -791,6 +906,51 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(502, f"twilio {e.code}: {detail}")
         except Exception as e:
             self.send_error(502, f"call failed: {e}")
+
+    # -- SMS webhooks ------------------------------------------------------------
+    def _handle_sms(self):
+        """Inbound text from Twilio — reply in the same message thread."""
+        if not PHONE_AVAILABLE:
+            return self.send_error(503, "phone not configured")
+        params = self._form()
+        if not self._twilio_ok(params):
+            return self.send_error(403, "bad twilio signature")
+        number = params.get("From", "")
+        body = (params.get("Body") or "").strip()
+        reply = SMS.handle_inbound(number, body) if body else ""
+        twiml = ('<?xml version="1.0" encoding="UTF-8"?><Response>'
+                 + (f"<Message>{_xml(reply)}</Message>" if reply else "")
+                 + "</Response>")
+        return self._send_twiml(twiml)
+
+    def _handle_text(self):
+        """Our API: start an outbound negotiation thread — {to, goal}."""
+        if not self._token_ok():
+            return self.send_error(403, "bad token")
+        if not PHONE_AVAILABLE:
+            return self.send_error(503, "phone not configured")
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(n))
+            to = (body.get("to") or "").strip()
+            goal = (body.get("goal") or "").strip()[:1000]
+        except Exception:
+            to, goal = "", ""
+        if not re.fullmatch(r"\+\d{7,15}", to):
+            return self.send_error(400, "to must be E.164, like +19705551234")
+        try:
+            opener = SMS.start_thread(to, goal)
+            out = json.dumps({"to": to, "opener": opener}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:300]
+            self.send_error(502, f"twilio {e.code}: {detail}")
+        except Exception as e:
+            self.send_error(502, f"text failed: {e}")
 
     # ElevenLabs streaming proxy — identical shape to the harness one
     def _handle_tts(self):
@@ -939,6 +1099,9 @@ def main():
         print(f"  phone      : Twilio {TWILIO_NUMBER}"
               + (f", webhooks at {PUBLIC_URL}/voice" if PUBLIC_URL
                  else " — set PUBLIC_URL (tunnel) for webhooks"), flush=True)
+        print(f"  sms        : inbound {PUBLIC_URL}/sms, outbound POST /text {{to,goal}}"
+              if PUBLIC_URL else "  sms        : set PUBLIC_URL for inbound texts",
+              flush=True)
     else:
         print("  phone      : not configured (set TWILIO_ACCOUNT_SID/AUTH_TOKEN/NUMBER)",
               flush=True)
