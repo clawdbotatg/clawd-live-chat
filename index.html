@@ -40,8 +40,28 @@
   .deepchip.done    { border-color: var(--accent); color: var(--accent); }
   .deepchip.error   { border-color: var(--err); color: var(--err); }
   @keyframes pulse { 50% { opacity: .45; } }
-  #reset { background: none; border: 1px solid #2b3550; color: var(--dim);
+  #reset, #callToggle { background: none; border: 1px solid #2b3550; color: var(--dim);
            border-radius: 8px; font-size: 11px; padding: 3px 9px; cursor: pointer; }
+  #callToggle.active { border-color: var(--accent); color: var(--accent); }
+  #callbar {
+    display: none; gap: 8px; padding: 10px 14px; background: var(--panel);
+    border-bottom: 1px solid #222a3d; flex-wrap: wrap; align-items: center;
+  }
+  #callbar.open { display: flex; }
+  #callbar input {
+    background: var(--bg); border: 1px solid #2b3550; color: var(--ink);
+    border-radius: 8px; padding: 7px 10px; font-size: 13px; font-family: inherit;
+  }
+  #callNum { width: 150px; }
+  #callGoal { flex: 1; min-width: 200px; }
+  #callGo {
+    background: var(--accent); border: none; color: #04120c; font-weight: 600;
+    border-radius: 8px; padding: 7px 16px; font-size: 13px; cursor: pointer;
+  }
+  #callGo:disabled { opacity: .5; cursor: default; }
+  #callStatus { font-size: 12px; color: var(--dim); width: 100%; }
+  #callStatus.err { color: var(--err); }
+  #callStatus.ok { color: var(--accent); }
 
   #chat { flex: 1; overflow-y: auto; padding: 16px 12px 8px; scroll-behavior: smooth; }
   .row { display: flex; margin: 6px 0; }
@@ -93,8 +113,15 @@
   <h1>🦞 clawd live</h1>
   <span id="pill">connecting…</span>
   <div id="deepbar"></div>
+  <button id="callToggle" title="place an outbound call">📞 call</button>
   <button id="reset" title="clear conversation">reset</button>
 </header>
+<div id="callbar">
+  <input id="callNum" placeholder="+19705551234" autocomplete="off">
+  <input id="callGoal" placeholder="her mission on this call (e.g. order a large cheese pizza to 123 Main St, pay cash)" autocomplete="off">
+  <button id="callGo">call</button>
+  <div id="callStatus"></div>
+</div>
 <div id="chat"></div>
 <div id="interim"></div>
 <footer>
@@ -394,6 +421,50 @@ box.addEventListener("keydown", e => {
 document.getElementById("reset").onclick = () => {
   if (confirm("Clear the whole conversation?")) send({ type: "reset" });
 };
+
+// ── outbound call launcher ────────────────────────────────────────────────────
+const callToggle = document.getElementById("callToggle");
+const callbar = document.getElementById("callbar");
+const callNum = document.getElementById("callNum");
+const callGoal = document.getElementById("callGoal");
+const callGo = document.getElementById("callGo");
+const callStatus = document.getElementById("callStatus");
+
+callToggle.onclick = () => {
+  const open = callbar.classList.toggle("open");
+  callToggle.classList.toggle("active", open);
+  if (open) callNum.focus();
+};
+function setCallStatus(msg, cls) {
+  callStatus.textContent = msg;
+  callStatus.className = cls || "";
+}
+async function placeCall() {
+  const to = callNum.value.trim().replace(/[()\s.-]/g, "");
+  const goal = callGoal.value.trim();
+  if (!/^\+\d{7,15}$/.test(to)) {
+    setCallStatus("number must be E.164, like +19705551234", "err");
+    return;
+  }
+  callGo.disabled = true;
+  setCallStatus("dialing " + to + "…", "");
+  try {
+    const r = await fetch("/call" + tok, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ to, goal }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) setCallStatus("ringing " + to + " — watch the transcript below (sid " + (j.sid || "?").slice(0, 10) + ")", "ok");
+    else setCallStatus("call failed: " + (j.error || r.status), "err");
+  } catch (e) {
+    setCallStatus("call failed: " + e.message, "err");
+  }
+  callGo.disabled = false;
+}
+callGo.onclick = placeCall;
+callGoal.addEventListener("keydown", e => { if (e.key === "Enter") placeCall(); });
+callNum.addEventListener("keydown", e => { if (e.key === "Enter") callGoal.focus(); });
 
 // tap-to-start: satisfies mic-permission + audio-autoplay gestures in one go
 overlay.onclick = () => {
