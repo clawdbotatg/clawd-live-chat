@@ -705,7 +705,9 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(n).decode("utf-8", errors="replace") if n else ""
         from urllib.parse import parse_qs
-        return {k: v[0] for k, v in parse_qs(body).items()}
+        # keep_blank_values: Twilio signs empty fields too — dropping them
+        # breaks X-Twilio-Signature validation
+        return {k: v[0] for k, v in parse_qs(body, keep_blank_values=True).items()}
 
     def _twilio_ok(self, params):
         if os.environ.get("PHONE_VALIDATE", "1") == "0":
@@ -715,7 +717,11 @@ class Handler(BaseHTTPRequestHandler):
         sig = self.headers.get("X-Twilio-Signature", "")
         payload = PUBLIC_URL + self.path + "".join(k + params[k] for k in sorted(params))
         mac = hmac.new(TWILIO_TOKEN.encode(), payload.encode(), hashlib.sha1)
-        return hmac.compare_digest(base64.b64encode(mac.digest()).decode(), sig)
+        ok = hmac.compare_digest(base64.b64encode(mac.digest()).decode(), sig)
+        if not ok:
+            print(f"[phone] signature reject: path={self.path} "
+                  f"params={sorted(params)}", flush=True)
+        return ok
 
     def _send_twiml(self, xml):
         data = xml.encode()
