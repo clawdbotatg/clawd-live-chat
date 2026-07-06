@@ -556,6 +556,7 @@ class PhoneLine:
         self.chat = chat
         self.spoken_idx = 0     # messages index already spoken down the line
         self.tts_cache = {}     # id -> mp3 bytes (capped)
+        self.pending_mission = None   # objective for the next outbound call
         self.lock = threading.Lock()
 
     def call_connected(self, params):
@@ -563,11 +564,19 @@ class PhoneLine:
         who = params.get("To" if direction.startswith("outbound") else "From", "unknown")
         base = len(self.chat.messages)
         self.spoken_idx = base  # don't replay pre-call chatter down the line
-        self.chat.messages.append({
-            "role": "user", "kind": "filler",
-            "content": f"[phone] A live phone call just connected ({direction}, "
+        mission, self.pending_mission = self.pending_mission, None
+        if mission and direction.startswith("outbound"):
+            content = (f"[phone] You just placed a phone call and the other side "
+                       f"({who}) answered. YOUR OBJECTIVE FOR THIS CALL: {mission}. "
+                       "This overrides any standing goal until the call ends. Open "
+                       "naturally like a person calling for exactly that reason, "
+                       "then work the objective through the call.")
+        else:
+            content = (f"[phone] A live phone call just connected ({direction}, "
                        f"other side: {who}). Greet the caller naturally in one "
-                       "short sentence, like answering the phone."})
+                       "short sentence, like answering the phone.")
+        self.chat.messages.append({"role": "user", "kind": "filler",
+                                   "content": content})
         self.chat._enqueue("turn")
         self._wait_assistant(base)
 
@@ -756,14 +765,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_error(503, "PUBLIC_URL not set — Twilio needs a public webhook URL")
         try:
             n = int(self.headers.get("Content-Length", "0"))
-            to = (json.loads(self.rfile.read(n)).get("to") or "").strip()
+            body = json.loads(self.rfile.read(n))
+            to = (body.get("to") or "").strip()
+            goal = (body.get("goal") or "").strip()[:1000]
         except Exception:
-            to = ""
+            to, goal = "", ""
         if not re.fullmatch(r"\+\d{7,15}", to):
             return self.send_error(400, "to must be E.164, like +19705551234")
+        PHONE.pending_mission = goal or None
         try:
             out = place_call(to)
-            print(f"[phone] outbound call placed to {to}: {out.get('sid')}", flush=True)
+            print(f"[phone] outbound call placed to {to}: {out.get('sid')}"
+                  + (f" mission: {goal[:80]!r}" if goal else ""), flush=True)
             body = json.dumps({"sid": out.get("sid"), "status": out.get("status")}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
