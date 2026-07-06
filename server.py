@@ -118,6 +118,12 @@ ELEVEN_AGENTS   = bool(ELEVEN_AGENT_ID and ELEVEN_PHONE_ID and ELEVENLABS_API_KE
 # Shared secret the ElevenLabs look_up tool sends (?k=) so only the agent can
 # reach our deep worker over the public /tool/lookup route.
 TOOL_SECRET     = os.environ.get("TOOL_SECRET", "")
+# Live lookups run on OUR claude subscription (claude-p-agent) with web tools
+# allowed — no third-party search API. Web tools must be whitelisted or `-p`
+# denies them (it can't prompt). ~19s typical; timeout stays under the tool window.
+LOOKUP_ARGS     = os.environ.get("LOOKUP_ARGS",
+                                 "--permission-mode acceptEdits --allowedTools WebSearch,WebFetch")
+LOOKUP_TIMEOUT  = int(os.environ.get("LOOKUP_TIMEOUT", "35"))
 # Dead-air filler: seconds after a deep dispatch to nudge the brain to hold the
 # floor (small talk) if the line is quiet. Backs off, then goes silent.
 DEEP_FILLER_AT = [7, 20, 40, 75]
@@ -1032,12 +1038,13 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 DEEP_CWD.mkdir(parents=True, exist_ok=True)
                 out = deep_run_turn(
-                    "Quick lookup: " + query,
+                    "Quick lookup, use WebSearch: " + query
+                    + " Reply with ONE short spoken sentence, no links or markdown.",
                     append_system_prompt=DEEP_APPEND_PROMPT,
                     cwd=str(DEEP_CWD),
-                    extra_args=shlex.split(DEEP_ARGS),
+                    extra_args=shlex.split(LOOKUP_ARGS),
                     return_meta=True,
-                    timeout=28,          # stay under the tool's 30s response window
+                    timeout=LOOKUP_TIMEOUT,
                 )
                 text = out.get("text", "") if isinstance(out, dict) else str(out)
                 if "SPOKEN SUMMARY:" in text:
