@@ -107,6 +107,14 @@ DEEPGRAM_KEY  = os.environ.get("DEEPGRAM_API_KEY", "")
 MEDIA_STREAMS = bool(DEEPGRAM_KEY and PUBLIC_URL) and os.environ.get("MEDIA_STREAMS", "1") != "0"
 MEDIA_WSS     = (PUBLIC_URL.replace("https://", "wss://").replace("http://", "ws://")
                  + "/media") if PUBLIC_URL else ""
+
+# ElevenLabs Agents: their platform hosts the whole voice call (STT + turn-taking
+# + TTS + Twilio), so voice needs no server of ours. We only place outbound calls
+# through their API and pass the per-call mission as a dynamic variable. Inbound
+# is wired at Twilio (voice webhook → api.elevenlabs.io) — nothing here handles it.
+ELEVEN_AGENT_ID = os.environ.get("ELEVEN_AGENT_ID", "")
+ELEVEN_PHONE_ID = os.environ.get("ELEVEN_PHONE_ID", "")
+ELEVEN_AGENTS   = bool(ELEVEN_AGENT_ID and ELEVEN_PHONE_ID and ELEVENLABS_API_KEY)
 # Dead-air filler: seconds after a deep dispatch to nudge the brain to hold the
 # floor (small talk) if the line is quiet. Backs off, then goes silent.
 DEEP_FILLER_AT = [7, 20, 40, 75]
@@ -652,7 +660,25 @@ class PhoneLine:
 PHONE = PhoneLine(CHAT)
 
 
-def place_call(to):
+def place_call(to, mission=""):
+    """Place an outbound voice call. Via ElevenLabs Agents when configured
+    (their platform runs the whole call); mission rides in as a dynamic var."""
+    if ELEVEN_AGENTS:
+        body = {"agent_id": ELEVEN_AGENT_ID,
+                "agent_phone_number_id": ELEVEN_PHONE_ID,
+                "to_number": to}
+        if mission:
+            body["conversation_initiation_client_data"] = {
+                "dynamic_variables": {"mission": mission}}
+        req = urllib.request.Request(
+            "https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
+            data=json.dumps(body).encode(), method="POST",
+            headers={"xi-api-key": ELEVENLABS_API_KEY, "content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            out = json.loads(r.read())
+        return {"sid": out.get("callSid"), "status": "queued" if out.get("success") else "failed",
+                "conversation_id": out.get("conversation_id")}
+    # Legacy direct-Twilio path (only if ElevenLabs Agents isn't configured)
     url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Calls.json"
     fields = {"To": to, "From": CALLER_ID,
               "Url": f"{PUBLIC_URL}/voice", "Method": "POST"}
@@ -916,9 +942,9 @@ class Handler(BaseHTTPRequestHandler):
             to, goal = "", ""
         if not re.fullmatch(r"\+\d{7,15}", to):
             return self.send_error(400, "to must be E.164, like +19705551234")
-        PHONE.pending_mission = goal or None
+        PHONE.pending_mission = goal or None   # only used by the legacy media path
         try:
-            out = place_call(to)
+            out = place_call(to, mission=goal)
             print(f"[phone] outbound call placed to {to}: {out.get('sid')}"
                   + (f" mission: {goal[:80]!r}" if goal else ""), flush=True)
             body = json.dumps({"sid": out.get("sid"), "status": out.get("status")}).encode()
@@ -1128,8 +1154,12 @@ def main():
         print(f"  sms        : inbound {PUBLIC_URL}/sms, outbound POST /text {{to,goal}}"
               if PUBLIC_URL else "  sms        : set PUBLIC_URL for inbound texts",
               flush=True)
-        print(f"  voice mode : {'MEDIA STREAMS (low-latency) via ' + MEDIA_WSS if MEDIA_STREAMS else 'Gather loop (set DEEPGRAM_API_KEY for streaming)'}",
-              flush=True)
+        if ELEVEN_AGENTS:
+            print(f"  voice mode : ElevenLabs Agents (agent {ELEVEN_AGENT_ID[:20]}…, "
+                  f"inbound at Twilio, outbound via /call)", flush=True)
+        else:
+            print(f"  voice mode : {'MEDIA STREAMS (low-latency) via ' + MEDIA_WSS if MEDIA_STREAMS else 'Gather loop'}",
+                  flush=True)
     else:
         print("  phone      : not configured (set TWILIO_ACCOUNT_SID/AUTH_TOKEN/NUMBER)",
               flush=True)
