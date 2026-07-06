@@ -115,6 +115,9 @@ MEDIA_WSS     = (PUBLIC_URL.replace("https://", "wss://").replace("http://", "ws
 ELEVEN_AGENT_ID = os.environ.get("ELEVEN_AGENT_ID", "")
 ELEVEN_PHONE_ID = os.environ.get("ELEVEN_PHONE_ID", "")
 ELEVEN_AGENTS   = bool(ELEVEN_AGENT_ID and ELEVEN_PHONE_ID and ELEVENLABS_API_KEY)
+# Shared secret the ElevenLabs look_up tool sends (?k=) so only the agent can
+# reach our deep worker over the public /tool/lookup route.
+TOOL_SECRET     = os.environ.get("TOOL_SECRET", "")
 # Dead-air filler: seconds after a deep dispatch to nudge the brain to hold the
 # floor (small talk) if the line is quiet. Backs off, then goes silent.
 DEEP_FILLER_AT = [7, 20, 40, 75]
@@ -859,6 +862,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_sms()
         if path == "/text":
             return self._handle_text()
+        if path == "/tool/lookup":
+            return self._handle_tool_lookup()
         self.send_error(404, "not found")
 
     # -- phone webhooks ----------------------------------------------------------
@@ -1003,6 +1008,51 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(502, f"twilio {e.code}: {detail}")
         except Exception as e:
             self.send_error(502, f"text failed: {e}")
+
+    # -- deep-worker tool (called by the ElevenLabs agent mid-call) --------------
+    def _handle_tool_lookup(self):
+        """The agent's look_up tool: run the deep worker, return an answer.
+
+        This is the two-tier handoff on the phone — the fast agent brain calls
+        this for anything current/factual, ElevenLabs plays a filler while it
+        runs, and we return a short spoken answer for her to relay.
+        """
+        if TOOL_SECRET and self._query().get("k", [""])[0] != TOOL_SECRET:
+            return self.send_error(403, "bad tool secret")
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            query = (json.loads(self.rfile.read(n)).get("query") or "").strip()[:1000]
+        except Exception:
+            query = ""
+        if not query:
+            return self.send_error(400, "empty query")
+        print(f"[tool] lookup: {query[:100]!r}", flush=True)
+        answer = "I couldn't dig that up just now."
+        if DEEP_AVAILABLE:
+            try:
+                DEEP_CWD.mkdir(parents=True, exist_ok=True)
+                out = deep_run_turn(
+                    "Quick lookup: " + query,
+                    append_system_prompt=DEEP_APPEND_PROMPT,
+                    cwd=str(DEEP_CWD),
+                    extra_args=shlex.split(DEEP_ARGS),
+                    return_meta=True,
+                    timeout=28,          # stay under the tool's 30s response window
+                )
+                text = out.get("text", "") if isinstance(out, dict) else str(out)
+                if "SPOKEN SUMMARY:" in text:
+                    text = text.rpartition("SPOKEN SUMMARY:")[2]
+                answer = " ".join(text.split())[:700] or answer
+            except Exception as e:
+                print(f"[tool] lookup failed: {e}", flush=True)
+                answer = "I tried to look but couldn't get through just now."
+        body = json.dumps({"answer": answer}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        print(f"[tool] answer: {answer[:100]!r}", flush=True)
 
     # ElevenLabs streaming proxy — identical shape to the harness one
     def _handle_tts(self):
