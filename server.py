@@ -99,6 +99,14 @@ TWILIO_NUMBER = os.environ.get("TWILIO_NUMBER", "")   # the agent's own line
 CALLER_ID     = os.environ.get("CALLER_ID", "") or TWILIO_NUMBER  # outbound from (verified)
 PUBLIC_URL    = os.environ.get("PUBLIC_URL", "").rstrip("/")
 PHONE_AVAILABLE = bool(TWILIO_SID and TWILIO_TOKEN and TWILIO_NUMBER)
+
+# Media Streams: the low-latency phone path (streaming STT/TTS over a WebSocket,
+# served by media_server.py). Enabled when a Deepgram key is present; falls back
+# to the <Gather> loop otherwise. MEDIA_STREAMS=0 forces the old path.
+DEEPGRAM_KEY  = os.environ.get("DEEPGRAM_API_KEY", "")
+MEDIA_STREAMS = bool(DEEPGRAM_KEY and PUBLIC_URL) and os.environ.get("MEDIA_STREAMS", "1") != "0"
+MEDIA_WSS     = (PUBLIC_URL.replace("https://", "wss://").replace("http://", "ws://")
+                 + "/media") if PUBLIC_URL else ""
 # Dead-air filler: seconds after a deep dispatch to nudge the brain to hold the
 # floor (small talk) if the line is quiet. Backs off, then goes silent.
 DEEP_FILLER_AT = [7, 20, 40, 75]
@@ -864,6 +872,24 @@ class Handler(BaseHTTPRequestHandler):
         params = self._form()
         if not self._twilio_ok(params):
             return self.send_error(403, "bad twilio signature")
+        # Media Streams path: hand the whole call to the audio WebSocket. Only the
+        # initial /voice hit matters here (the stream stays open for the call).
+        if MEDIA_STREAMS and connected:
+            direction = params.get("Direction", "inbound")
+            who = params.get("To" if direction.startswith("outbound") else "From", "")
+            mission = ""
+            if direction.startswith("outbound"):
+                mission, PHONE.pending_mission = (PHONE.pending_mission or ""), None
+            print(f"[phone] media-stream call: {direction} {who} "
+                  f"mission={mission[:60]!r}", flush=True)
+            twiml = ('<?xml version="1.0" encoding="UTF-8"?><Response><Connect>'
+                     f'<Stream url="{_xml(MEDIA_WSS)}">'
+                     f'<Parameter name="direction" value="{_xml(direction)}"/>'
+                     f'<Parameter name="caller" value="{_xml(who)}"/>'
+                     f'<Parameter name="mission" value="{_xml(mission)}"/>'
+                     '</Stream></Connect></Response>')
+            return self._send_twiml(twiml)
+        # Legacy <Gather> loop (no Deepgram key configured)
         if connected:
             print(f"[phone] call connected: {params.get('Direction')} "
                   f"{params.get('From')} -> {params.get('To')}", flush=True)
@@ -1101,6 +1127,8 @@ def main():
                  else " — set PUBLIC_URL (tunnel) for webhooks"), flush=True)
         print(f"  sms        : inbound {PUBLIC_URL}/sms, outbound POST /text {{to,goal}}"
               if PUBLIC_URL else "  sms        : set PUBLIC_URL for inbound texts",
+              flush=True)
+        print(f"  voice mode : {'MEDIA STREAMS (low-latency) via ' + MEDIA_WSS if MEDIA_STREAMS else 'Gather loop (set DEEPGRAM_API_KEY for streaming)'}",
               flush=True)
     else:
         print("  phone      : not configured (set TWILIO_ACCOUNT_SID/AUTH_TOKEN/NUMBER)",
