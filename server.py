@@ -29,6 +29,8 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import TCPServer, ThreadingMixIn
@@ -676,9 +678,13 @@ def place_call(to, mission=""):
         body = {"agent_id": ELEVEN_AGENT_ID,
                 "agent_phone_number_id": ELEVEN_PHONE_ID,
                 "to_number": to}
+        # Give her the current time so time/date/timezone questions need no lookup.
+        now = datetime.now(ZoneInfo("America/Denver")).strftime(
+            "%A, %B %-d, %Y at %-I:%M %p Mountain Time")
+        dyn = {"now": now}
         if mission:
-            body["conversation_initiation_client_data"] = {
-                "dynamic_variables": {"mission": mission}}
+            dyn["mission"] = mission
+        body["conversation_initiation_client_data"] = {"dynamic_variables": dyn}
         req = urllib.request.Request(
             "https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
             data=json.dumps(body).encode(), method="POST",
