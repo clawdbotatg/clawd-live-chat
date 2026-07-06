@@ -636,9 +636,12 @@ PHONE = PhoneLine(CHAT)
 
 def place_call(to):
     url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Calls.json"
-    data = urllib.parse.urlencode({
-        "To": to, "From": CALLER_ID,
-        "Url": f"{PUBLIC_URL}/voice", "Method": "POST"}).encode()
+    fields = {"To": to, "From": CALLER_ID,
+              "Url": f"{PUBLIC_URL}/voice", "Method": "POST"}
+    if os.environ.get("CALL_RECORD", "1") != "0":
+        fields["Record"] = "true"           # dual-channel: her voice vs. theirs
+        fields["RecordingChannels"] = "dual"
+    data = urllib.parse.urlencode(fields).encode()
     auth = base64.b64encode(f"{TWILIO_SID}:{TWILIO_TOKEN}".encode()).decode()
     req = urllib.request.Request(url, data=data, method="POST",
                                  headers={"Authorization": f"Basic {auth}"})
