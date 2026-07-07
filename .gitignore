@@ -4,3 +4,4 @@
 .clawd-live-chat.key.pem
 deepwork/
 __pycache__/
+.clawd-live-chat.voice

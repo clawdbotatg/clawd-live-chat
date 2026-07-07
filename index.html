@@ -40,8 +40,10 @@
   .deepchip.done    { border-color: var(--accent); color: var(--accent); }
   .deepchip.error   { border-color: var(--err); color: var(--err); }
   @keyframes pulse { 50% { opacity: .45; } }
-  #reset, #callToggle, #textToggle { background: none; border: 1px solid #2b3550;
+  #reset, #callToggle, #textToggle, #voiceSel { background: none; border: 1px solid #2b3550;
            color: var(--dim); border-radius: 8px; font-size: 11px; padding: 3px 9px; cursor: pointer; }
+  #voiceSel { max-width: 140px; }
+  #voiceSel option { background: var(--panel); color: var(--ink); }
   #callToggle.active, #textToggle.active { border-color: var(--accent); color: var(--accent); }
   #callbar, #textbar {
     display: none; gap: 8px; padding: 10px 14px; background: var(--panel);
@@ -115,6 +117,7 @@
   <h1>🦞 clawd live</h1>
   <span id="pill">connecting…</span>
   <div id="deepbar"></div>
+  <select id="voiceSel" title="TTS voice" style="display:none"></select>
   <button id="callToggle" title="place an outbound call">📞 call</button>
   <button id="textToggle" title="start a text negotiation">💬 text</button>
   <button id="reset" title="clear conversation">reset</button>
@@ -281,6 +284,43 @@ function stopAudio() {
   if ("speechSynthesis" in window) speechSynthesis.cancel();
 }
 
+// ── voice picker ─────────────────────────────────────────────────────────────
+const voiceSel = document.getElementById("voiceSel");
+let voicePreviewPending = false;
+function renderVoices(voices, cur) {
+  if (!voices || voices.length < 2 || !ttsEnabled) return;
+  voiceSel.innerHTML = "";
+  for (const v of voices) {
+    const o = document.createElement("option");
+    o.value = v.id;
+    o.textContent = "🎙 " + v.name;
+    voiceSel.appendChild(o);
+  }
+  voiceSel.value = cur;
+  voiceSel.style.display = "";
+}
+voiceSel.onchange = () => {
+  voicePreviewPending = true;
+  send({ type: "voice", id: voiceSel.value });
+};
+async function previewVoice() {
+  const text = "Hey, this is what I sound like now.";
+  try {
+    const r = await fetch("/tts" + tok, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!r.ok) return;
+    const blob = await r.blob();
+    recentSpoken = (recentSpoken + " " + norm(text)).slice(-600);  // echo guard
+    const url = URL.createObjectURL(blob);
+    const a = new Audio(url);
+    a.onended = () => URL.revokeObjectURL(url);
+    a.play().catch(() => {});
+  } catch (e) {}
+}
+
 function webSpeechFallback(text) {
   if (!("speechSynthesis" in window)) return;
   const u = new SpeechSynthesisUtterance(text);
@@ -394,6 +434,7 @@ function connect() {
       }
       for (const d of m.deep || []) upsertDeep(d);
       if (!m.deepAvailable) interimEl.textContent = "⚠ deep tier disabled on server";
+      renderVoices(m.voices, m.voice);
       refreshPill();
     } else if (m.type === "user") {
       addBubble("me", m.text);
@@ -421,6 +462,11 @@ function connect() {
     } else if (m.type === "deep") {
       upsertDeep(m);
       addDeepCard(m);
+    } else if (m.type === "voices") {
+      renderVoices(m.voices, m.voice);
+    } else if (m.type === "voice") {
+      voiceSel.value = m.id;
+      if (voicePreviewPending) { voicePreviewPending = false; previewVoice(); }
     } else if (m.type === "sms") {
       addSms(m);
     } else if (m.type === "error") {

@@ -82,6 +82,26 @@ FAST_MAX_TOKENS = int(os.environ.get("FAST_MAX_TOKENS", "700"))
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "") or "nPczCjzI2devNBz1zQrb"
 
+# Voice picker: the env/default voice plus a curated shortlist, switchable live
+# from the UI. Names resolve from the ElevenLabs API in a background thread at
+# boot (until then the raw id shows). The pick persists across restarts in
+# VOICE_FILE; ELEVENLABS_VOICE_ID stays the boot default.
+VOICE_PRESETS = [ELEVENLABS_VOICE_ID,
+                 "lLgB6ZeIe84FSJa9pO1a",
+                 "6IwYbsNENZgAB1dtBZDp",
+                 "S9NKLs1GeSTKzXd9D0Lf",
+                 "dSByRdUbTGloB7TFA1qD"]
+VOICES = [{"id": v, "name": v[:8] + "…"} for v in dict.fromkeys(VOICE_PRESETS)]
+VOICE_IDS = {v["id"] for v in VOICES}
+VOICE_FILE = HERE / ".clawd-live-chat.voice"
+CUR_VOICE = {"id": ELEVENLABS_VOICE_ID}
+try:
+    _saved = VOICE_FILE.read_text().strip()
+    if _saved in VOICE_IDS:
+        CUR_VOICE["id"] = _saved
+except OSError:
+    pass
+
 # Deep tier (claude-p-agent engine)
 CLAUDE_P_HOME = os.environ.get("CLAUDE_P_AGENT_HOME",
                                str(HERE.parent / "claude-p-agent"))
@@ -344,7 +364,9 @@ class Chat:
                      "deep": list(self.deep_tasks.values()),
                      "tts": bool(ELEVENLABS_API_KEY),
                      "deepAvailable": DEEP_AVAILABLE,
-                     "model": FAST_MODEL})
+                     "model": FAST_MODEL,
+                     "voices": VOICES,
+                     "voice": CUR_VOICE["id"]})
 
     def remove_client(self, c):
         with self.lock:
@@ -563,7 +585,7 @@ def _xml(s):
 
 
 def elevenlabs_mp3(text):
-    url = (f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
+    url = (f"https://api.elevenlabs.io/v1/text-to-speech/{CUR_VOICE['id']}/stream"
            "?optimize_streaming_latency=3&output_format=mp3_44100_64")
     body = json.dumps({
         "text": text[:4000],
@@ -1081,7 +1103,7 @@ class Handler(BaseHTTPRequestHandler):
             text = ""
         if not text:
             return self.send_error(400, "empty text")
-        url = (f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
+        url = (f"https://api.elevenlabs.io/v1/text-to-speech/{CUR_VOICE['id']}/stream"
                "?optimize_streaming_latency=3&output_format=mp3_44100_64")
         req_body = json.dumps({
             "text": text,
@@ -1160,6 +1182,16 @@ class Handler(BaseHTTPRequestHandler):
                     CHAT.cancel_current()
                 elif t == "reset":
                     CHAT.reset()
+                elif t == "voice":
+                    vid = str(frame.get("id", ""))
+                    if vid in VOICE_IDS and vid != CUR_VOICE["id"]:
+                        CUR_VOICE["id"] = vid
+                        try:
+                            VOICE_FILE.write_text(vid)
+                        except OSError:
+                            pass
+                        print(f"[tts] voice -> {vid}", flush=True)
+                        CHAT.broadcast({"type": "voice", "id": vid})
                 elif t == "ping":
                     client.send_json({"type": "pong", "id": frame.get("id")})
         finally:
@@ -1188,7 +1220,39 @@ def _ensure_cert():
     print(f"[tls] self-signed cert generated for {ip}", flush=True)
 
 
+def _resolve_voice_names():
+    """Fill in human names for the voice picker (background, best-effort).
+    Account voices answer /v1/voices/{id}; library voices not saved to the
+    account 404 there but turn up via the shared-voices search-by-id."""
+    def _get(url):
+        req = urllib.request.Request(url, headers={"xi-api-key": ELEVENLABS_API_KEY})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.load(resp)
+    changed = False
+    for v in VOICES:
+        name = ""
+        try:
+            name = (_get(f"https://api.elevenlabs.io/v1/voices/{v['id']}")
+                    .get("name") or "").strip()
+        except Exception:
+            try:
+                hits = _get("https://api.elevenlabs.io/v1/shared-voices"
+                            f"?search={v['id']}").get("voices") or []
+                name = next((h.get("name", "") for h in hits
+                             if h.get("voice_id") == v["id"]), "").strip()
+            except Exception:
+                pass  # offline / unknown id — raw id stays
+        if name:
+            v["name"] = name
+            changed = True
+    if changed:
+        CHAT.broadcast({"type": "voices", "voices": VOICES,
+                        "voice": CUR_VOICE["id"]})
+
+
 def main():
+    if ELEVENLABS_API_KEY:
+        threading.Thread(target=_resolve_voice_names, daemon=True).start()
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
     scheme = "http"
     if USE_TLS:
@@ -1207,7 +1271,7 @@ def main():
                   "will be text-only.", flush=True)
     print(f"  fast brain : {FAST_MODEL} via {BANKR_BASE_URL} "
           f"({'keyed' if BANKR_API_KEY else 'NO KEY — chat will fail'})", flush=True)
-    print(f"  tts        : {'ElevenLabs ' + ELEVENLABS_VOICE_ID if ELEVENLABS_API_KEY else 'browser fallback'}", flush=True)
+    print(f"  tts        : {'ElevenLabs ' + CUR_VOICE['id'] + f' (+{len(VOICES)-1} more in picker)' if ELEVENLABS_API_KEY else 'browser fallback'}", flush=True)
     print(f"  deep tier  : {'claude-p-agent @ ' + CLAUDE_P_HOME if DEEP_AVAILABLE else 'DISABLED'}"
           f" (cwd {DEEP_CWD})", flush=True)
     if PHONE_AVAILABLE:
