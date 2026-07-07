@@ -87,6 +87,7 @@ ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "") or "nPczCjzI2dev
 # boot (until then the raw id shows). The pick persists across restarts in
 # VOICE_FILE; ELEVENLABS_VOICE_ID stays the boot default.
 VOICE_PRESETS = [ELEVENLABS_VOICE_ID,
+                 "uIZsnBL0YK1S5j69bAih",
                  "lLgB6ZeIe84FSJa9pO1a",
                  "6IwYbsNENZgAB1dtBZDp",
                  "S9NKLs1GeSTKzXd9D0Lf",
