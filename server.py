@@ -217,6 +217,8 @@ Dispatch for: live or current information, looking anything up, building or chan
 
 While a deep task runs, keep chatting normally. Messages starting with [deep result] are the worker reporting back — relay the substance to the user conversationally in a few spoken sentences (never read paths or raw output verbatim unless asked).
 
+Messages starting with [call report] mean you just got back from a real phone call you made on the user's behalf. Tell the user how it went in your own words, leading with the direct answer to whatever they sent you to find out — like a friend reporting back, not a form being read.
+
 Messages starting with [deep progress] mean your lookup is still running and the line has gone quiet. Dead air on a call is awkward — say ONE short, natural line to hold the floor: small talk, a light question back to the user, or an in-persona aside like "ugh, my computer's being slow today, almost there". Vary it every time, never repeat an earlier filler, never mention workers or tasks, and never dispatch anything new from a filler."""
 
 if CALL_GOAL:
@@ -395,6 +397,12 @@ class Chat:
     def on_user(self, text):
         text = (text or "").strip()
         if not text:
+            return
+        live = calls_live()
+        if live:   # she's on the phone — one conversation at a time
+            self.broadcast({"type": "notice",
+                            "text": f"📞 she's on a call with {live[0].get('to')} — "
+                                    "she'll report back here when it ends"})
             return
         self.cancel_current()                       # new utterance interrupts
         self.last_activity = time.time()
@@ -750,6 +758,13 @@ CALL_LOG_LOCK = threading.Lock()
 CALL_LIVE_STATES = ("ringing", "initiated", "in-progress", "processing")
 
 
+def calls_live():
+    """Outbound calls currently in flight. While one is live, she is ON THE
+    PHONE: no second call, no texts, and the browser chat holds."""
+    with CALL_LOG_LOCK:
+        return [r for r in CALL_LOG.values() if r.get("status") in CALL_LIVE_STATES]
+
+
 def _eleven_get(path, raw=False, timeout=30):
     req = urllib.request.Request("https://api.elevenlabs.io" + path,
                                  headers={"xi-api-key": ELEVENLABS_API_KEY})
@@ -865,6 +880,13 @@ def watch_call(conversation_id):
     CHAT.broadcast({"type": "call", **_call_public(rec)})
     print(f"[call] debrief {conversation_id} ({rec.get('to')}): "
           f"{(rec['answer'] or '')[:120]!r}", flush=True)
+    # She walks back into the room and tells you how it went: the debrief
+    # re-enters the browser conversation as a spoken turn (deep-result pattern).
+    inject = (f"[call report] You just hung up a real phone call to {rec.get('to')}."
+              + (f" Your mission was: {rec.get('goal')}" if rec.get("goal") else "")
+              + f"\nDebrief: {rec.get('answer') or rec.get('summary') or 'no details'}")
+    CHAT.messages.append({"role": "user", "content": inject, "kind": "call"})
+    CHAT._enqueue("turn")
 
 
 def start_call_watch(conversation_id, to, goal):
@@ -1093,6 +1115,14 @@ class Handler(BaseHTTPRequestHandler):
                   f"params={sorted(params)}", flush=True)
         return ok
 
+    def _send_json(self, code, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _send_twiml(self, xml):
         data = xml.encode()
         self.send_response(200)
@@ -1151,6 +1181,10 @@ class Handler(BaseHTTPRequestHandler):
             to, goal = "", ""
         if not re.fullmatch(r"\+\d{7,15}", to):
             return self.send_error(400, "to must be E.164, like +19705551234")
+        live = calls_live()
+        if live:
+            return self._send_json(409, {"error": f"she's already on a call with "
+                                                  f"{live[0].get('to')} — wait for it to end"})
         PHONE.pending_mission = goal or None   # only used by the legacy media path
         try:
             out = place_call(to, mission=goal)
@@ -1194,6 +1228,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_error(403, "bad token")
         if not PHONE_AVAILABLE:
             return self.send_error(503, "phone not configured")
+        live = calls_live()
+        if live:
+            return self._send_json(409, {"error": f"she's on a call with "
+                                                  f"{live[0].get('to')} — wait for it to end"})
         try:
             n = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(n))
