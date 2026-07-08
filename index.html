@@ -64,6 +64,22 @@
   #callStatus, #textStatus { font-size: 12px; color: var(--dim); width: 100%; }
   #callStatus.err, #textStatus.err { color: var(--err); }
   #callStatus.ok, #textStatus.ok { color: var(--accent); }
+  .callcard {
+    max-width: 88%; font-size: 13px; border: 1px solid #2b3550;
+    border-radius: 12px; padding: 10px 14px; background: var(--panel);
+  }
+  .callcard .callhead { color: var(--dim); font-size: 12px; letter-spacing: .03em; }
+  .callcard .callhead .st { color: var(--warn); }
+  .callcard.done .callhead .st { color: var(--accent); }
+  .callcard.dead .callhead .st { color: var(--err); }
+  .callcard.live .callhead .st { animation: pulse 1.6s infinite; }
+  .callcard .goal { color: var(--dim); font-style: italic; margin-top: 3px; }
+  .callcard .answer { margin-top: 8px; white-space: pre-wrap; }
+  .callcard details { margin-top: 8px; }
+  .callcard summary { cursor: pointer; color: var(--dim); font-size: 12px; }
+  .callcard .tx { white-space: pre-wrap; color: var(--dim); font-size: 12px;
+    max-height: 240px; overflow-y: auto; margin-top: 6px; }
+  .callcard audio { width: 100%; margin-top: 8px; height: 32px; }
   .bubble.sms { border: 1px dashed #3a4560; }
   .smstag { font-size: 10px; color: var(--dim); margin-bottom: 3px; letter-spacing: .03em; }
 
@@ -191,6 +207,65 @@ function addSms(m) {
   chatEl.appendChild(row);
   scrollDown();
 }
+// ── call mission cards: one card per outbound call, updated live ─────────────
+const callCards = {};   // conversation_id -> card element
+const CALL_LIVE = new Set(["ringing", "initiated", "in-progress", "processing"]);
+function upsertCall(rec) {
+  let card = callCards[rec.conversation_id];
+  if (!card) {
+    const row = document.createElement("div");
+    row.className = "row deep";
+    card = document.createElement("div");
+    card.className = "callcard";
+    callCards[rec.conversation_id] = card;
+    row.appendChild(card);
+    chatEl.appendChild(row);
+  }
+  const live = CALL_LIVE.has(rec.status);
+  const dead = rec.status === "failed" || rec.status === "lost";
+  card.className = "callcard" + (live ? " live" : dead ? " dead" : " done");
+  card.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "callhead";
+  const stLabel = live ? (rec.status === "ringing" ? "📞 calling…" : "📞 on the call…")
+                : dead ? "📞 call " + rec.status
+                : "📞 call done" + (rec.duration ? ` (${Math.round(rec.duration)}s)` : "");
+  head.innerHTML = `<span class="st"></span> — `;
+  head.querySelector(".st").textContent = stLabel;
+  head.appendChild(document.createTextNode(rec.to || ""));
+  card.appendChild(head);
+  if (rec.goal) {
+    const g = document.createElement("div");
+    g.className = "goal";
+    g.textContent = "mission: " + rec.goal;
+    card.appendChild(g);
+  }
+  if (rec.answer) {
+    const a = document.createElement("div");
+    a.className = "answer";
+    a.textContent = rec.answer;
+    card.appendChild(a);
+  }
+  if (rec.transcript && rec.transcript.length) {
+    const d = document.createElement("details");
+    const s = document.createElement("summary");
+    s.textContent = "transcript (" + rec.transcript.length + " lines)";
+    const tx = document.createElement("div");
+    tx.className = "tx";
+    tx.textContent = rec.transcript.join("\n");
+    d.appendChild(s); d.appendChild(tx);
+    card.appendChild(d);
+  }
+  if (rec.audio) {
+    const au = document.createElement("audio");
+    au.controls = true;
+    au.preload = "none";
+    au.src = "/calls/" + encodeURIComponent(rec.conversation_id) + ".mp3" + tok;
+    card.appendChild(au);
+  }
+  scrollDown();
+}
+
 function addDeepCard(rec) {
   const row = document.createElement("div");
   row.className = "row deep";
@@ -432,6 +507,8 @@ function connect() {
         if (h.role === "user") addBubble("me", h.content);
         else addBubble("bot", h.content.replace(/\[\[\s*DEEP:[\s\S]*?\]\]/g, "").trim());
       }
+      for (const k in callCards) delete callCards[k];   // chat was wiped
+      for (const c of m.calls || []) upsertCall(c);
       for (const d of m.deep || []) upsertDeep(d);
       if (!m.deepAvailable) interimEl.textContent = "⚠ deep tier disabled on server";
       renderVoices(m.voices, m.voice);
@@ -467,12 +544,15 @@ function connect() {
     } else if (m.type === "voice") {
       voiceSel.value = m.id;
       if (voicePreviewPending) { voicePreviewPending = false; previewVoice(); }
+    } else if (m.type === "call") {
+      upsertCall(m);
     } else if (m.type === "sms") {
       addSms(m);
     } else if (m.type === "error") {
       addBubble("bot", "⚠ " + m.text).style.color = "#f87171";
     } else if (m.type === "resetDone") {
       chatEl.innerHTML = "";
+      for (const k in callCards) delete callCards[k];
     }
   };
 }
@@ -526,7 +606,7 @@ async function placeCall() {
       body: JSON.stringify({ to, goal }),
     });
     const j = await r.json().catch(() => ({}));
-    if (r.ok) setCallStatus("ringing " + to + " — watch the transcript below (sid " + (j.sid || "?").slice(0, 10) + ")", "ok");
+    if (r.ok) setCallStatus("ringing " + to + " — she'll report back below when the call ends", "ok");
     else setCallStatus("call failed: " + (j.error || r.status), "err");
   } catch (e) {
     setCallStatus("call failed: " + e.message, "err");

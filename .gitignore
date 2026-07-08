@@ -3,5 +3,6 @@
 .clawd-live-chat.cert.pem
 .clawd-live-chat.key.pem
 deepwork/
+calls/
 __pycache__/
 .clawd-live-chat.voice

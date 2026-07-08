@@ -152,6 +152,14 @@ LOOKUP_TIMEOUT  = int(os.environ.get("LOOKUP_TIMEOUT", "35"))
 DEEP_FILLER_AT = [7, 20, 40, 75]
 FILLER_MIN_IDLE = 5  # only fill if nobody has spoken for this many seconds
 
+# Call missions: every outbound call gets a background watcher that polls the
+# ElevenLabs conversation until it ends, then pulls the transcript + audio,
+# debriefs the goal into a direct answer, and reports back to the browser.
+# Records persist under CALLS_DIR (gitignored) as <conversation_id>.json/.mp3.
+CALLS_DIR      = Path(os.environ.get("CALLS_DIR", str(HERE / "calls")))
+CALL_POLL_SECS = int(os.environ.get("CALL_POLL_SECS", "8"))
+CALL_WATCH_MAX = int(os.environ.get("CALL_WATCH_MAX", "3600"))  # give up after 1h
+
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 sys.path.insert(0, CLAUDE_P_HOME)
@@ -362,6 +370,7 @@ class Chat:
             self.clients.add(c)
         c.send_json({"type": "init",
                      "history": self.messages[-100:],
+                     "calls": recent_calls(limit=10),
                      "deep": list(self.deep_tasks.values()),
                      "tts": bool(ELEVENLABS_API_KEY),
                      "deepAvailable": DEEP_AVAILABLE,
@@ -706,7 +715,11 @@ def place_call(to, mission=""):
             "%A, %B %-d, %Y at %-I:%M %p Mountain Time")
         dyn = {"now": now}
         if mission:
-            dyn["mission"] = mission
+            # Nudge her to actually close the loop: a mission call should end
+            # with a definite outcome, not drift into open-ended small talk.
+            dyn["mission"] = (mission + " Once this objective is settled either way "
+                              "(a clear yes, a clear no, or they genuinely can't answer), "
+                              "wrap up warmly like a normal person and end the call.")
         body["conversation_initiation_client_data"] = {"dynamic_variables": dyn}
         req = urllib.request.Request(
             "https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
@@ -729,6 +742,138 @@ def place_call(to, mission=""):
                                  headers={"Authorization": f"Basic {auth}"})
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read())
+
+
+# ── call missions: watch the call, debrief it, report the answer ──────────────
+CALL_LOG = {}                 # conversation_id -> record (mirrors CALLS_DIR json)
+CALL_LOG_LOCK = threading.Lock()
+CALL_LIVE_STATES = ("ringing", "initiated", "in-progress", "processing")
+
+
+def _eleven_get(path, raw=False, timeout=30):
+    req = urllib.request.Request("https://api.elevenlabs.io" + path,
+                                 headers={"xi-api-key": ELEVENLABS_API_KEY})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read() if raw else json.loads(r.read())
+
+
+def _call_public(rec):
+    """The slice of a call record that goes over the wire to browsers."""
+    return {k: rec.get(k) for k in
+            ("conversation_id", "to", "goal", "status", "placed", "duration",
+             "answer", "summary", "call_successful", "transcript", "audio")}
+
+
+def _save_call(rec):
+    try:
+        CALLS_DIR.mkdir(exist_ok=True)
+        (CALLS_DIR / f"{rec['conversation_id']}.json").write_text(
+            json.dumps(rec, indent=2))
+    except OSError as e:
+        print(f"[call] persist failed: {e}", flush=True)
+
+
+def _load_calls():
+    """Boot: reload persisted call records; resume watching unfinished ones."""
+    if not CALLS_DIR.is_dir():
+        return
+    for f in sorted(CALLS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime):
+        try:
+            rec = json.loads(f.read_text())
+            CALL_LOG[rec["conversation_id"]] = rec
+        except Exception:
+            continue
+    pending = [r for r in CALL_LOG.values() if r.get("status") in CALL_LIVE_STATES]
+    for rec in pending:
+        threading.Thread(target=watch_call, args=(rec["conversation_id"],),
+                         daemon=True).start()
+    if CALL_LOG:
+        print(f"[call] {len(CALL_LOG)} past call(s) loaded"
+              + (f", resuming {len(pending)} watch(es)" if pending else ""), flush=True)
+
+
+def recent_calls(limit=10):
+    with CALL_LOG_LOCK:
+        recs = sorted(CALL_LOG.values(), key=lambda r: r.get("placed", 0))
+    return [_call_public(r) for r in recs[-limit:]]
+
+
+DEBRIEF_SYS = """You are debriefing a phone call an agent just made on the user's behalf. Given the mission and the transcript ("her" = the agent, "them" = the person called), report the outcome in 2-4 plain sentences. Lead with the direct answer to the mission (e.g. "Jim said yes to coffee Thursday, 10am at Bindle."). Then any load-bearing details: times, conditions, things they promised, mood. If they didn't pick up or the mission wasn't resolved, say so plainly and note anything useful (voicemail left, said to call back tonight). No preamble, no markdown."""
+
+
+def debrief_answer(goal, transcript_lines, summary):
+    """One cheap fast-brain pass: finished call -> the answer the user sent her for."""
+    if not transcript_lines:
+        return "Nobody picked up — the call never became a conversation."
+    if not goal:
+        return summary or ""
+    try:
+        return bankr_complete(
+            [{"role": "system", "content": DEBRIEF_SYS},
+             {"role": "user", "content": f"MISSION: {goal}\n\nTRANSCRIPT:\n"
+                                         + "\n".join(transcript_lines)}],
+            max_tokens=250, temperature=0.2)
+    except Exception as e:
+        print(f"[call] debrief LLM failed ({e}) — falling back to summary", flush=True)
+        return summary or "(call ended — debrief failed, transcript below)"
+
+
+def watch_call(conversation_id):
+    """Poll the ElevenLabs conversation until the call ends, then debrief:
+    transcript + analysis + audio -> answer, persisted and broadcast."""
+    rec = CALL_LOG[conversation_id]
+    deadline = time.time() + CALL_WATCH_MAX
+    data = {}
+    while time.time() < deadline:
+        time.sleep(CALL_POLL_SECS)
+        try:
+            data = _eleven_get(f"/v1/convai/conversations/{conversation_id}")
+        except Exception as e:
+            print(f"[call] poll error for {conversation_id}: {e}", flush=True)
+            continue
+        status = data.get("status") or ""
+        if status and status != rec.get("status"):
+            rec["status"] = status
+            CHAT.broadcast({"type": "call", **_call_public(rec)})
+        if status in ("done", "failed"):
+            break
+    else:
+        rec["status"] = "lost"   # watched for an hour and it never finished
+    lines = []
+    for t in data.get("transcript") or []:
+        msg = (t.get("message") or "").strip()
+        if msg:
+            lines.append(("her: " if t.get("role") == "agent" else "them: ") + msg)
+    analysis = data.get("analysis") or {}
+    meta = data.get("metadata") or {}
+    rec["duration"] = meta.get("call_duration_secs")
+    rec["transcript"] = lines
+    rec["summary"] = analysis.get("transcript_summary") or ""
+    rec["call_successful"] = analysis.get("call_successful")
+    rec["answer"] = debrief_answer(rec.get("goal", ""), lines, rec["summary"])
+    rec["audio"] = False
+    try:
+        audio = _eleven_get(f"/v1/convai/conversations/{conversation_id}/audio",
+                            raw=True, timeout=60)
+        if audio:
+            CALLS_DIR.mkdir(exist_ok=True)
+            (CALLS_DIR / f"{conversation_id}.mp3").write_bytes(audio)
+            rec["audio"] = True
+    except Exception as e:
+        print(f"[call] no audio for {conversation_id}: {e}", flush=True)
+    _save_call(rec)
+    CHAT.broadcast({"type": "call", **_call_public(rec)})
+    print(f"[call] debrief {conversation_id} ({rec.get('to')}): "
+          f"{(rec['answer'] or '')[:120]!r}", flush=True)
+
+
+def start_call_watch(conversation_id, to, goal):
+    rec = {"conversation_id": conversation_id, "to": to, "goal": goal,
+           "status": "ringing", "placed": time.time()}
+    with CALL_LOG_LOCK:
+        CALL_LOG[conversation_id] = rec
+    CHAT.broadcast({"type": "call", **_call_public(rec)})
+    threading.Thread(target=watch_call, args=(conversation_id,), daemon=True).start()
 
 
 # ── SMS negotiation (Twilio Messaging) ─────────────────────────────────────────
@@ -871,6 +1016,30 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_ws()
         if path in ("/", "/index.html"):
             return self._serve_file(HERE / "index.html", "text/html; charset=utf-8")
+        if path == "/calls":
+            if not self._token_ok():
+                return self.send_error(403, "bad token")
+            data = json.dumps(recent_calls(limit=50)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return self.wfile.write(data)
+        if path.startswith("/calls/") and path.endswith(".mp3"):
+            if not self._token_ok():
+                return self.send_error(403, "bad token")
+            conv_id = path[len("/calls/"):-len(".mp3")]
+            f = CALLS_DIR / f"{conv_id}.mp3"
+            # ids are ElevenLabs-issued tokens; reject anything path-like
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", conv_id) or not f.is_file():
+                return self.send_error(404, "not found")
+            mp3 = f.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Length", str(len(mp3)))
+            self.end_headers()
+            return self.wfile.write(mp3)
         if path.startswith("/voice/tts/"):
             tid = path.rsplit("/", 1)[-1].removesuffix(".mp3")
             mp3 = PHONE.tts_cache.get(tid)
@@ -987,7 +1156,11 @@ class Handler(BaseHTTPRequestHandler):
             out = place_call(to, mission=goal)
             print(f"[phone] outbound call placed to {to}: {out.get('sid')}"
                   + (f" mission: {goal[:80]!r}" if goal else ""), flush=True)
-            body = json.dumps({"sid": out.get("sid"), "status": out.get("status")}).encode()
+            conv_id = out.get("conversation_id")
+            if conv_id:
+                start_call_watch(conv_id, to, goal)
+            body = json.dumps({"sid": out.get("sid"), "status": out.get("status"),
+                               "conversation_id": conv_id}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -1254,6 +1427,7 @@ def _resolve_voice_names():
 def main():
     if ELEVENLABS_API_KEY:
         threading.Thread(target=_resolve_voice_names, daemon=True).start()
+        _load_calls()
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
     scheme = "http"
     if USE_TLS:
