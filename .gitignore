@@ -6,3 +6,4 @@ deepwork/
 calls/
 __pycache__/
 .clawd-live-chat.voice
+.clawd-live-chat.log
