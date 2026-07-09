@@ -295,7 +295,10 @@ function setMode(m) {
   if (m === "sms") smsTab.classList.remove("unread");
   if (m === "phone") phoneTab.classList.remove("unread");
   if (location.hash !== "#" + m) history.replaceState(null, "", "#" + m);
-  if (m !== "chat") micOffEverywhere();   // phone/sms mode silences EVERY window
+  if (m !== "chat") {
+    micOffEverywhere();        // same-profile tabs: instant, via BroadcastChannel
+    send({ type: "micoff" });  // every other profile/browser: via the server
+  }
   syncMic();
 }
 for (const b of tabBtns) b.onclick = () => setMode(b.dataset.mode);
@@ -693,7 +696,11 @@ let bootId = null;   // server's boot id; a change means new code — reload the
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws${tok}`);
-  ws.onopen = () => refreshPill();
+  ws.onopen = () => {
+    send({ type: "hello" });                       // new-protocol handshake
+    if (mode !== "chat") send({ type: "micoff" }); // booted into phone/sms: silence the whole app
+    refreshPill();
+  };
   ws.onclose = () => { setPill("", "reconnecting…"); setTimeout(connect, 1200); };
   ws.onmessage = ev => {
     let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
@@ -752,6 +759,15 @@ function connect() {
       if (voicePreviewPending) { voicePreviewPending = false; previewVoice(); }
     } else if (m.type === "call") {
       upsertCall(m);
+    } else if (m.type === "micoff") {
+      // server-relayed: some client somewhere entered phone/sms mode.
+      // Reaches every profile/browser — unlike the BroadcastChannel.
+      if (mode === "chat") {
+        micOn = false;
+        stopAudio();
+        syncMic();
+        interimEl.textContent = "mic off — phone/sms mode is active in another window";
+      }
     } else if (m.type === "notice") {
       const row = document.createElement("div");
       row.className = "row deep";

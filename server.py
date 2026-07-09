@@ -320,6 +320,8 @@ class Client:
         self.wfile = wfile
         self.lock = threading.Lock()
         self.dead = False
+        self.hello = False   # new-protocol handshake; stale-code clients never send it
+        self.ua = "?"
 
     def send_json(self, obj):
         if self.dead:
@@ -416,6 +418,7 @@ class Chat:
         text = (text or "").strip()
         if not text:
             return
+        print(f"[chat] user: {text[:100]!r}", flush=True)   # evidence trail
         live = calls_live()
         if live:   # she's on the phone — one conversation at a time
             self.broadcast({"type": "notice",
@@ -1504,8 +1507,9 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
         client = Client(self.wfile)
+        client.ua = (self.headers.get("User-Agent") or "?")[:90]
         CHAT.add_client(client)
-        print("[ws] client connected", flush=True)
+        print(f"[ws] client connected ({client.ua})", flush=True)
         try:
             while True:
                 try:
@@ -1530,10 +1534,24 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     continue
                 t = frame.get("type")
-                if t == "user":
+                if t == "hello":
+                    client.hello = True
+                elif t == "micoff":
+                    # a client entered phone/sms mode: order EVERY connected
+                    # client (any tab, window, profile, browser) to drop its mic
+                    print(f"[ws] micoff relay from ({client.ua})", flush=True)
+                    CHAT.broadcast({"type": "micoff"})
+                elif t == "user":
+                    if not client.hello:
+                        # stale-code client (never sent the handshake): the brain
+                        # will NOT answer it — log loudly so it can be hunted down
+                        print(f"[ws] DROPPED user msg from stale client ({client.ua}): "
+                              f"{(frame.get('text') or '')[:80]!r}", flush=True)
+                        continue
                     CHAT.on_user(frame.get("text", ""))
                 elif t == "cancel":
-                    CHAT.cancel_current()
+                    if client.hello:
+                        CHAT.cancel_current()
                 elif t == "reset":
                     CHAT.reset()
                 elif t == "voice":
