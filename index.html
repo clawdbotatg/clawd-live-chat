@@ -561,6 +561,7 @@ function makeRec() {
   r.interimResults = true;
   r.lang = "en-US";
   r.onresult = ev => {
+    if (!micOn || !micAllowed()) return;   // a held/background tab is deaf
     let interim = "", finals = "";
     for (let i = ev.resultIndex; i < ev.results.length; i++) {
       const t = ev.results[i][0].transcript;
@@ -585,7 +586,10 @@ function makeRec() {
       sendUser(text);
     }
   };
-  r.onend = () => { recAlive = false; if (micOn) setTimeout(startRec, 80); };
+  // restart ONLY while the mic is allowed to run — restarting on intent alone
+  // makes a held/background tab fight the active tab for Chrome's one-per-
+  // browser recognizer, chopping the real conversation into fragments
+  r.onend = () => { recAlive = false; if (micOn && micAllowed()) setTimeout(startRec, 80); };
   r.onerror = e => {
     recAlive = false;
     if (e.error === "not-allowed") {
@@ -599,14 +603,17 @@ let lastAudioEnd = 0;
 function genRecently() { return Date.now() - lastAudioEnd < 1200; }
 
 function startRec() {
+  if (!micOn || !micAllowed()) return;
   if (!rec) rec = makeRec();
   if (!rec || recAlive) return;
   try { rec.start(); recAlive = true; } catch (e) {}
   refreshPill();
 }
 function stopRec() {
-  if (rec && recAlive) try { rec.stop(); } catch (e) {}
+  // abort (not stop): discard half-heard results instead of finalizing them
+  if (rec && recAlive) try { rec.abort(); } catch (e) {}
   recAlive = false;
+  interimEl.textContent = "";
   refreshPill();
 }
 
