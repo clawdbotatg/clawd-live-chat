@@ -425,14 +425,16 @@ function refreshPill() {
 }
 let genWaiting = false;
 
-// ── mic + chat audio run ONLY while chat is front-and-center ─────────────────
-// micOn is user INTENT (orb / overlay). The mic actually listens — and chat TTS
-// actually plays — only in chat mode, in the visible tab, with no live phone
-// call. Otherwise a background tab keeps talking, hears the foreground tab's
-// speaker through the mic, and the conversation cascades over itself.
+// ── the mic is OFF unless chat is front-and-center AND the user just asked ───
+// HARD RULE: the moment chat stops being front-and-center (phone/sms tab,
+// hidden tab, live phone call), the mic doesn't pause — it TURNS OFF. micOn
+// itself is cleared, so no restore path, no onend restart, no timer can ever
+// resurrect listening. Getting the mic back always takes a deliberate tap on
+// the orb. Chat TTS is gated the same way.
 const liveCalls = new Set();
 function micAllowed() { return mode === "chat" && !document.hidden && liveCalls.size === 0; }
 function syncMic() {
+  if (!micAllowed() && micOn) micOn = false;   // hard off — never survives a hold
   if (micOn && micAllowed()) {
     orb.className = "listening";
     startRec();
