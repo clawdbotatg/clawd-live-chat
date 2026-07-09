@@ -445,6 +445,22 @@ function syncMic() {
 }
 document.addEventListener("visibilitychange", syncMic);
 
+// ── cross-tab mic election: exactly ONE tab may hold the mic ─────────────────
+// Chrome grants SpeechRecognition to one tab at a time; two visible windows
+// both trying to listen steal it from each other and chop every utterance.
+// Turning the mic on broadcasts a claim; every other tab drops its own mic
+// (orb goes grey there). Last tap wins.
+const TAB_ID = Math.random().toString(36).slice(2);
+const micBus = "BroadcastChannel" in window ? new BroadcastChannel("clawd-mic") : null;
+if (micBus) micBus.onmessage = ev => {
+  if (ev.data && ev.data.type === "claim" && ev.data.id !== TAB_ID && micOn) {
+    micOn = false;
+    syncMic();
+    interimEl.textContent = "mic moved to another tab — tap the orb to take it back";
+  }
+};
+function claimMic() { if (micBus) micBus.postMessage({ type: "claim", id: TAB_ID }); }
+
 function updateCallHold() {
   const held = liveCalls.size > 0;
   box.disabled = held;
@@ -653,6 +669,7 @@ function stopRec() {
 orb.onclick = () => {
   if (liveCalls.size) return;   // she's on the phone — mic stays off
   micOn = !micOn;
+  if (micOn) claimMic();        // every other tab lets go of the mic
   syncMic();
 };
 
@@ -912,6 +929,7 @@ overlay.onclick = () => {
   const a = new Audio("data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAACAAABhgC7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7v///////////////////////////////////////////8AAAAATGF2YzU4LjEzAAAAAAAAAAAAAAAAJAAAAAAAAAAAAYYoRBqpAAAAAAD/+xDEAAPAAAGkAAAAIAAANIAAAARMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV");
   a.play().catch(() => {});
   micOn = true;
+  claimMic();  // every other tab lets go of the mic
   syncMic();   // starts listening only if chat is front-and-center right now
 };
 

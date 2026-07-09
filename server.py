@@ -797,15 +797,20 @@ def _eleven_req(method, path, body=None, timeout=30):
 # add dead air before every reply. Ordered fast+cheap → smart+slower;
 # claude-sonnet-4-6 is the deliberate "hard missions" outlier.
 AGENT_LLMS = [
-    "claude-haiku-4-5",       # default — fast, warm, holds the persona
+    "claude-haiku-4-5",       # default — fast (~0.6s first token), holds the persona
     "gemini-2.5-flash-lite",  # cheapest/fastest reasonable
     "gemini-2.5-flash",       # proven low-latency workhorse
+    "gemini-3.1-flash-lite",  # newer Gemini lite tier
     "gemini-3.5-flash",       # newest Gemini flash tier
     "gpt-5-mini",             # proven OpenAI mini
     "gpt-5.4-nano",           # newest nano — very fast, very cheap
     "gpt-5.4-mini",           # newest mini
-    "claude-sonnet-4-6",      # smartest here; noticeably slower on a call
+    "claude-sonnet-4-6",      # smartest Anthropic model ElevenLabs takes; slower
 ]
+# Probed live 2026-07-09 (PATCH each id, then revert): claude-sonnet-5 (released
+# 2026-06-30) is REJECTED by ElevenLabs, as are claude-haiku-5 / claude-opus-4-8 /
+# gemini-3.5-flash-lite / gemini-4-flash / grok-4-fast; gpt-5.5-mini/nano silently
+# coerce to the 5.4 tier. Re-probe now and then and add sonnet-5 when it lands.
 AGENT_LLM_RE = re.compile(r"[A-Za-z0-9.@_-]{2,64}")
 
 
