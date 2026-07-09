@@ -43,6 +43,7 @@
     background: #222a3d; color: var(--dim); transition: all .2s;
   }
   #pill.listening { background: #0f2b22; color: var(--accent); }
+  #build { font-size: 10px; color: #3a4560; font-family: ui-monospace, Menlo, monospace; }
   #pill.thinking  { background: #2b230f; color: var(--warn); }
   #pill.speaking  { background: #16233d; color: #93b4f8; }
   #deepbar { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
@@ -187,6 +188,7 @@
     <button data-mode="sms">💬 sms</button>
   </nav>
   <span id="pill">connecting…</span>
+  <span id="build" title="build this tab is running — must match the latest commit"></span>
   <div id="deepbar"></div>
   <select id="voiceSel" title="TTS voice" style="display:none"></select>
   <button id="reset" title="clear conversation">reset</button>
@@ -293,6 +295,7 @@ function setMode(m) {
   if (m === "sms") smsTab.classList.remove("unread");
   if (m === "phone") phoneTab.classList.remove("unread");
   if (location.hash !== "#" + m) history.replaceState(null, "", "#" + m);
+  if (m !== "chat") micOffEverywhere();   // phone/sms mode silences EVERY window
   syncMic();
 }
 for (const b of tabBtns) b.onclick = () => setMode(b.dataset.mode);
@@ -455,13 +458,22 @@ document.addEventListener("visibilitychange", syncMic);
 const TAB_ID = Math.random().toString(36).slice(2);
 const micBus = "BroadcastChannel" in window ? new BroadcastChannel("clawd-mic") : null;
 if (micBus) micBus.onmessage = ev => {
-  if (ev.data && ev.data.type === "claim" && ev.data.id !== TAB_ID && micOn) {
+  const d = ev.data || {};
+  if (d.id === TAB_ID) return;
+  if (d.type === "claim" && micOn) {
     micOn = false;
     syncMic();
     interimEl.textContent = "mic moved to another tab — tap the orb to take it back";
+  } else if (d.type === "micoff") {
+    // some tab entered phone/sms mode: the WHOLE app goes silent and deaf
+    micOn = false;
+    stopAudio();
+    syncMic();
+    interimEl.textContent = "mic off — phone/sms mode is active in another tab";
   }
 };
 function claimMic() { if (micBus) micBus.postMessage({ type: "claim", id: TAB_ID }); }
+function micOffEverywhere() { if (micBus) micBus.postMessage({ type: "micoff", id: TAB_ID }); }
 
 function updateCallHold() {
   const held = liveCalls.size > 0;
@@ -688,6 +700,7 @@ function connect() {
     if (m.type === "init") {
       if (bootId && m.boot && m.boot !== bootId) { location.reload(); return; }
       if (m.boot) bootId = m.boot;
+      if (m.build) document.getElementById("build").textContent = m.build;
       ttsEnabled = m.tts;
       chatEl.innerHTML = "";
       for (const h of m.history || []) {

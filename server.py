@@ -164,6 +164,20 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # New id every boot; clients reload when it changes so no tab runs stale UI.
 BOOT_ID = secrets.token_hex(8)
 
+
+def _git_sha():
+    """Short SHA of the running checkout — shown in the UI header so a stale
+    tab is visible at a glance instead of a debugging mystery."""
+    try:
+        import subprocess
+        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=HERE,
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+
+
+BUILD = _git_sha()
+
 sys.path.insert(0, CLAUDE_P_HOME)
 try:
     from agent import run_turn as deep_run_turn        # claude-p-agent engine
@@ -374,6 +388,7 @@ class Chat:
             self.clients.add(c)
         c.send_json({"type": "init",
                      "boot": BOOT_ID,
+                     "build": BUILD,
                      "history": self.messages[-100:],
                      "calls": recent_calls(limit=10),
                      "deep": list(self.deep_tasks.values()),
