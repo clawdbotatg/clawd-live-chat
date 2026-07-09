@@ -161,6 +161,8 @@ CALL_POLL_SECS = int(os.environ.get("CALL_POLL_SECS", "8"))
 CALL_WATCH_MAX = int(os.environ.get("CALL_WATCH_MAX", "3600"))  # give up after 1h
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# New id every boot; clients reload when it changes so no tab runs stale UI.
+BOOT_ID = secrets.token_hex(8)
 
 sys.path.insert(0, CLAUDE_P_HOME)
 try:
@@ -371,6 +373,7 @@ class Chat:
         with self.lock:
             self.clients.add(c)
         c.send_json({"type": "init",
+                     "boot": BOOT_ID,
                      "history": self.messages[-100:],
                      "calls": recent_calls(limit=10),
                      "deep": list(self.deep_tasks.values()),

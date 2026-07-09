@@ -251,28 +251,16 @@ const tabBtns = [...document.querySelectorAll("#tabs button")];
 const phoneTab = tabBtns.find(b => b.dataset.mode === "phone");
 const smsTab = tabBtns.find(b => b.dataset.mode === "sms");
 let mode = "chat";
-let micHeldByMode = false;   // mic was on when we left chat mode — restore on return
 
 function setMode(m) {
   if (!views[m]) m = "chat";
   mode = m;
   for (const k in views) views[k].style.display = (k === m) ? "" : "none";
   for (const b of tabBtns) b.classList.toggle("active", b.dataset.mode === m);
-  if (m !== "chat") {
-    if (micOn) {
-      micHeldByMode = true;
-      micOn = false; orb.className = "off";
-      stopRec(); stopAudio();
-    }
-  } else if (micHeldByMode && !liveCalls.size) {
-    micHeldByMode = false;
-    micOn = true; orb.className = "listening";
-    startRec();
-  }
   if (m === "sms") smsTab.classList.remove("unread");
   if (m === "phone") phoneTab.classList.remove("unread");
   if (location.hash !== "#" + m) history.replaceState(null, "", "#" + m);
-  refreshPill();
+  syncMic();
 }
 for (const b of tabBtns) b.onclick = () => setMode(b.dataset.mode);
 window.addEventListener("hashchange", () => {
@@ -399,33 +387,37 @@ function refreshPill() {
   if (liveCalls.size) setPill("speaking", "📞 on a call");
   else if (playing) setPill("speaking", "speaking");
   else if (genWaiting) setPill("thinking", "thinking");
-  else if (micOn) setPill("listening", "listening");
+  else if (micOn && micAllowed()) setPill("listening", "listening");
   else setPill("", "idle");
 }
 let genWaiting = false;
 
-// ── one conversation at a time: browser chat holds while she's on the phone ──
+// ── mic + chat audio run ONLY while chat is front-and-center ─────────────────
+// micOn is user INTENT (orb / overlay). The mic actually listens — and chat TTS
+// actually plays — only in chat mode, in the visible tab, with no live phone
+// call. Otherwise a background tab keeps talking, hears the foreground tab's
+// speaker through the mic, and the conversation cascades over itself.
 const liveCalls = new Set();
-let micHeldByCall = false;
+function micAllowed() { return mode === "chat" && !document.hidden && liveCalls.size === 0; }
+function syncMic() {
+  if (micOn && micAllowed()) {
+    orb.className = "listening";
+    startRec();
+  } else {
+    orb.className = "off";
+    stopRec();
+  }
+  if (!micAllowed()) stopAudio();   // never speak over the phone/sms tab or a hidden tab
+  refreshPill();
+}
+document.addEventListener("visibilitychange", syncMic);
+
 function updateCallHold() {
   const held = liveCalls.size > 0;
   box.disabled = held;
   box.placeholder = held ? "📞 she's on a call — chat resumes when it ends" : "or type here…";
   orb.style.opacity = held ? ".4" : "";
-  if (held && micOn) {
-    micHeldByCall = true;
-    micOn = false; orb.className = "off";
-    stopRec(); stopAudio();
-  } else if (!held && micHeldByCall) {
-    micHeldByCall = false;
-    if (mode === "chat") {
-      micOn = true; orb.className = "listening";
-      startRec();
-    } else {
-      micHeldByMode = true;   // restore when they come back to chat mode
-    }
-  }
-  refreshPill();
+  syncMic();
 }
 
 // ── deep chips ───────────────────────────────────────────────────────────────
@@ -620,16 +612,13 @@ function stopRec() {
 
 orb.onclick = () => {
   if (liveCalls.size) return;   // she's on the phone — mic stays off
-  micHeldByCall = false;        // manual toggle overrides any pending auto-restore
-  micHeldByMode = false;
   micOn = !micOn;
-  orb.className = micOn ? "listening" : "off";
-  if (micOn) startRec(); else stopRec();
-  refreshPill();
+  syncMic();
 };
 
 // ── websocket ────────────────────────────────────────────────────────────────
 let curBotBubble = null;
+let bootId = null;   // server's boot id; a change means new code — reload the page
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws${tok}`);
@@ -638,6 +627,8 @@ function connect() {
   ws.onmessage = ev => {
     let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
     if (m.type === "init") {
+      if (bootId && m.boot && m.boot !== bootId) { location.reload(); return; }
+      if (m.boot) bootId = m.boot;
       ttsEnabled = m.tts;
       chatEl.innerHTML = "";
       for (const h of m.history || []) {
@@ -668,7 +659,8 @@ function connect() {
         (curBotBubble.textContent + m.text).replace(/\[\[\s*DEEP:[\s\S]*$/, "");
       scrollDown();
     } else if (m.type === "speak") {
-      if (m.gen === liveGen && !cancelledGens.has(m.gen)) enqueueSpeech(m);
+      // chat TTS only plays where the chat is actually being watched
+      if (m.gen === liveGen && !cancelledGens.has(m.gen) && micAllowed()) enqueueSpeech(m);
     } else if (m.type === "assistant_done") {
       genWaiting = false;
       if (curBotBubble) {
@@ -804,10 +796,8 @@ overlay.onclick = () => {
   overlay.remove();
   const a = new Audio("data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAACAAABhgC7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7v///////////////////////////////////////////8AAAAATGF2YzU4LjEzAAAAAAAAAAAAAAAAJAAAAAAAAAAAAYYoRBqpAAAAAAD/+xDEAAPAAAGkAAAAIAAANIAAAARMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV");
   a.play().catch(() => {});
-  if (liveCalls.size) return;   // she's mid-call — chat stays held
   micOn = true;
-  orb.className = "listening";
-  startRec();
+  syncMic();   // starts listening only if chat is front-and-center right now
 };
 
 connect();
