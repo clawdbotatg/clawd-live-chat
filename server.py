@@ -833,9 +833,20 @@ def debrief_answer(goal, transcript_lines, summary):
         return summary or "(call ended — debrief failed, transcript below)"
 
 
+def _transcript_lines(data):
+    lines = []
+    for t in data.get("transcript") or []:
+        msg = (t.get("message") or "").strip()
+        if msg:
+            lines.append(("her: " if t.get("role") == "agent" else "them: ") + msg)
+    return lines
+
+
 def watch_call(conversation_id):
     """Poll the ElevenLabs conversation until the call ends, then debrief:
-    transcript + analysis + audio -> answer, persisted and broadcast."""
+    transcript + analysis + audio -> answer, persisted and broadcast.
+    Mid-call polls also carry the transcript-so-far, so the browser's phone
+    view shows the conversation as it happens."""
     rec = CALL_LOG[conversation_id]
     deadline = time.time() + CALL_WATCH_MAX
     data = {}
@@ -847,18 +858,21 @@ def watch_call(conversation_id):
             print(f"[call] poll error for {conversation_id}: {e}", flush=True)
             continue
         status = data.get("status") or ""
+        changed = False
         if status and status != rec.get("status"):
             rec["status"] = status
+            changed = True
+        lines = _transcript_lines(data)
+        if lines != (rec.get("transcript") or []):
+            rec["transcript"] = lines
+            changed = True
+        if changed:
             CHAT.broadcast({"type": "call", **_call_public(rec)})
         if status in ("done", "failed"):
             break
     else:
         rec["status"] = "lost"   # watched for an hour and it never finished
-    lines = []
-    for t in data.get("transcript") or []:
-        msg = (t.get("message") or "").strip()
-        if msg:
-            lines.append(("her: " if t.get("role") == "agent" else "them: ") + msg)
+    lines = _transcript_lines(data)
     analysis = data.get("analysis") or {}
     meta = data.get("metadata") or {}
     rec["duration"] = meta.get("call_duration_secs")
