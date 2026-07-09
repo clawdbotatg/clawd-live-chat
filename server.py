@@ -775,6 +775,53 @@ def _eleven_get(path, raw=False, timeout=30):
         return r.read() if raw else json.loads(r.read())
 
 
+def _eleven_req(method, path, body=None, timeout=30):
+    req = urllib.request.Request(
+        "https://api.elevenlabs.io" + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        method=method,
+        headers={"xi-api-key": ELEVENLABS_API_KEY,
+                 "content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+# ── phone agent settings (voice / model / persona live on ElevenLabs) ─────────
+# The whole phone call runs on their platform, so the system prompt + LLM are
+# agent config there — we read/PATCH it via the API. Partial PATCH deep-merges
+# (verified live: patching only the prompt left llm + the look_up tool intact).
+#
+# AGENT_LLMS: curated from the live /v1/convai/llm-usage/calculate catalog
+# (2026-07, ~90 models). A phone loop needs fast first-token models —
+# ElevenLabs' own guidance is the Flash / Haiku / mini-nano tiers; big models
+# add dead air before every reply. Ordered fast+cheap → smart+slower;
+# claude-sonnet-4-6 is the deliberate "hard missions" outlier.
+AGENT_LLMS = [
+    "claude-haiku-4-5",       # default — fast, warm, holds the persona
+    "gemini-2.5-flash-lite",  # cheapest/fastest reasonable
+    "gemini-2.5-flash",       # proven low-latency workhorse
+    "gemini-3.5-flash",       # newest Gemini flash tier
+    "gpt-5-mini",             # proven OpenAI mini
+    "gpt-5.4-nano",           # newest nano — very fast, very cheap
+    "gpt-5.4-mini",           # newest mini
+    "claude-sonnet-4-6",      # smartest here; noticeably slower on a call
+]
+AGENT_LLM_RE = re.compile(r"[A-Za-z0-9.@_-]{2,64}")
+
+
+def _agent_public(cfg):
+    conv = cfg.get("conversation_config") or {}
+    agent = conv.get("agent") or {}
+    prompt = agent.get("prompt") or {}
+    return {"name": cfg.get("name"),
+            "prompt": prompt.get("prompt") or "",
+            "llm": prompt.get("llm") or "",
+            "first_message": agent.get("first_message") or "",
+            "voice_id": (conv.get("tts") or {}).get("voice_id") or "",
+            "models": AGENT_LLMS,
+            "voices": VOICES}
+
+
 def _call_public(rec):
     """The slice of a call record that goes over the wire to browsers."""
     return {k: rec.get(k) for k in
@@ -1055,6 +1102,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_ws()
         if path in ("/", "/index.html"):
             return self._serve_file(HERE / "index.html", "text/html; charset=utf-8")
+        if path == "/agent":
+            if not self._token_ok():
+                return self.send_error(403, "bad token")
+            if not ELEVEN_AGENTS:
+                return self._send_json(503, {"error": "ElevenLabs agent not configured"})
+            try:
+                cfg = _eleven_get(f"/v1/convai/agents/{ELEVEN_AGENT_ID}")
+                return self._send_json(200, _agent_public(cfg))
+            except Exception as e:
+                return self._send_json(502, {"error": f"agent fetch failed: {e}"})
         if path == "/calls":
             if not self._token_ok():
                 return self.send_error(403, "bad token")
@@ -1101,6 +1158,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_voice(connected=False)
         if path == "/call":
             return self._handle_call()
+        if path == "/agent":
+            return self._handle_agent_update()
         if path == "/sms":
             return self._handle_sms()
         if path == "/text":
@@ -1222,6 +1281,52 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(502, f"twilio {e.code}: {detail}")
         except Exception as e:
             self.send_error(502, f"call failed: {e}")
+
+    def _handle_agent_update(self):
+        """Edit the phone agent on ElevenLabs: {prompt?, llm?, first_message?,
+        voice_id?} — only provided fields are patched (deep-merge, verified)."""
+        if not self._token_ok():
+            return self.send_error(403, "bad token")
+        if not ELEVEN_AGENTS:
+            return self._send_json(503, {"error": "ElevenLabs agent not configured"})
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(n))
+        except Exception:
+            return self._send_json(400, {"error": "bad json"})
+        agent, prompt = {}, {}
+        p = body.get("prompt")
+        if isinstance(p, str) and p.strip():
+            prompt["prompt"] = p.strip()[:20000]
+        llm = body.get("llm")
+        if llm:
+            if not AGENT_LLM_RE.fullmatch(str(llm)):
+                return self._send_json(400, {"error": f"bad llm id: {llm!r}"})
+            prompt["llm"] = str(llm)
+        if prompt:
+            agent["prompt"] = prompt
+        if isinstance(body.get("first_message"), str):
+            agent["first_message"] = body["first_message"].strip()[:500]
+        patch = {"conversation_config": {}}
+        if agent:
+            patch["conversation_config"]["agent"] = agent
+        v = body.get("voice_id")
+        if v:
+            if not re.fullmatch(r"[A-Za-z0-9]{8,64}", str(v)):
+                return self._send_json(400, {"error": f"bad voice id: {v!r}"})
+            patch["conversation_config"]["tts"] = {"voice_id": str(v)}
+        if not patch["conversation_config"]:
+            return self._send_json(400, {"error": "nothing to update"})
+        try:
+            cfg = _eleven_req("PATCH", f"/v1/convai/agents/{ELEVEN_AGENT_ID}", patch)
+            print(f"[agent] updated: {sorted(patch['conversation_config'])}"
+                  + (f" llm={prompt.get('llm')}" if prompt.get("llm") else ""), flush=True)
+            return self._send_json(200, _agent_public(cfg))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:300]
+            return self._send_json(502, {"error": f"elevenlabs {e.code}: {detail}"})
+        except Exception as e:
+            return self._send_json(502, {"error": f"agent update failed: {e}"})
 
     # -- SMS webhooks ------------------------------------------------------------
     def _handle_sms(self):
