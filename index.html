@@ -464,6 +464,7 @@ if (micBus) micBus.onmessage = ev => {
   const d = ev.data || {};
   if (d.id === TAB_ID) return;
   if (d.type === "claim" && micOn) {
+    diag("mic-lost-to-claim");
     micOn = false;
     syncMic();
     interimEl.textContent = "mic moved to another tab — tap the orb to take it back";
@@ -619,6 +620,9 @@ function looksLikeEcho(text) {
 }
 
 // ── speech recognition (Web Speech API) ──────────────────────────────────────
+// diag: recognition lifecycle + every dropped result, streamed to the server
+// log — so "STT is terrible" debugs from evidence, not theory.
+function diag(ev, extra) { send(Object.assign({ type: "diag", ev }, extra || {})); }
 function makeRec() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) { interimEl.textContent = "⚠ no Web Speech API in this browser — type instead"; return null; }
@@ -626,8 +630,12 @@ function makeRec() {
   r.continuous = true;
   r.interimResults = true;
   r.lang = "en-US";
+  r.onstart = () => diag("rec-start");
   r.onresult = ev => {
-    if (!micOn || !micAllowed()) return;   // a held/background tab is deaf
+    if (!micOn || !micAllowed()) {         // a held/background tab is deaf
+      diag("result-dropped-guard", { micOn, allowed: micAllowed(), mode });
+      return;
+    }
     let interim = "", finals = "";
     for (let i = ev.resultIndex; i < ev.results.length; i++) {
       const t = ev.results[i][0].transcript;
@@ -647,16 +655,25 @@ function makeRec() {
     if (finals.trim()) {
       interimEl.textContent = "";
       const text = finals.trim();
-      if ((playing || genRecently()) && looksLikeEcho(text)) return;  // self-echo
+      if ((playing || genRecently()) && looksLikeEcho(text)) {        // self-echo
+        diag("final-echo-dropped", { text: text.slice(0, 80), playing });
+        return;
+      }
       if (playing) bargeIn();
+      diag("final-accepted", { text: text.slice(0, 80) });
       sendUser(text);
     }
   };
   // restart ONLY while the mic is allowed to run — restarting on intent alone
   // makes a held/background tab fight the active tab for Chrome's one-per-
   // browser recognizer, chopping the real conversation into fragments
-  r.onend = () => { recAlive = false; if (micOn && micAllowed()) setTimeout(startRec, 80); };
+  r.onend = () => {
+    diag("rec-end", { willRestart: !!(micOn && micAllowed()) });
+    recAlive = false;
+    if (micOn && micAllowed()) setTimeout(startRec, 80);
+  };
   r.onerror = e => {
+    diag("rec-error", { err: e.error });
     recAlive = false;
     if (e.error === "not-allowed") {
       micOn = false; orb.className = "off";
@@ -698,7 +715,9 @@ function connect() {
   ws = new WebSocket(`${proto}://${location.host}/ws${tok}`);
   ws.onopen = () => {
     send({ type: "hello" });                       // new-protocol handshake
-    if (mode !== "chat") send({ type: "micoff" }); // booted into phone/sms: silence the whole app
+    // a VISIBLE phone/sms tab silences the app on (re)connect; a background
+    // one must not — otherwise every reconnect mutes the chat you're using
+    if (mode !== "chat" && !document.hidden) send({ type: "micoff" });
     refreshPill();
   };
   ws.onclose = () => { setPill("", "reconnecting…"); setTimeout(connect, 1200); };
@@ -763,6 +782,7 @@ function connect() {
       // server-relayed: some client somewhere entered phone/sms mode.
       // Reaches every profile/browser — unlike the BroadcastChannel.
       if (mode === "chat") {
+        if (micOn) diag("mic-lost-to-micoff");
         micOn = false;
         stopAudio();
         syncMic();

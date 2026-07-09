@@ -1536,6 +1536,10 @@ class Handler(BaseHTTPRequestHandler):
                 t = frame.get("type")
                 if t == "hello":
                     client.hello = True
+                elif t == "diag":
+                    extra = {k: v for k, v in frame.items() if k not in ("type", "ev")}
+                    print(f"[diag] {frame.get('ev')}"
+                          + (f" {json.dumps(extra)[:160]}" if extra else ""), flush=True)
                 elif t == "micoff":
                     # a client entered phone/sms mode: order EVERY connected
                     # client (any tab, window, profile, browser) to drop its mic
