@@ -74,7 +74,7 @@
     border-radius: 8px; padding: 9px 11px; font-size: 14px; font-family: inherit;
   }
   #callNum, #textNum { width: 170px; }
-  #callGoal, #textGoal { flex: 1; min-width: 220px; }
+  #callGoal, #textGoal, #chatIntent { flex: 1; min-width: 220px; }
   .launcher .go {
     background: var(--accent); border: none; color: #04120c; font-weight: 600;
     border-radius: 8px; padding: 9px 22px; font-size: 14px; cursor: pointer;
@@ -196,6 +196,12 @@
 
 <!-- ── live chat mode ──────────────────────────────────────────────────── -->
 <main id="chatView" class="view">
+  <div class="launcher" id="chatLauncher">
+    <div class="lrow">
+      <input id="chatIntent" placeholder="her intent — the same mission phone calls use (steers this chat too)" autocomplete="off">
+    </div>
+    <!-- the shared ⚙ agent settings panel moves here in chat mode -->
+  </div>
   <div id="chat"></div>
   <div id="interim"></div>
   <footer>
@@ -212,10 +218,10 @@
 
 <!-- ── phone mode ──────────────────────────────────────────────────────── -->
 <main id="phoneView" class="view" style="display:none">
-  <div class="launcher">
+  <div class="launcher" id="phoneLauncher">
     <div class="lrow">
       <input id="callNum" placeholder="+19705551234" autocomplete="off" inputmode="tel">
-      <input id="callGoal" placeholder="her mission on this call (e.g. order a large cheese pizza to 123 Main St, pay cash)" autocomplete="off">
+      <input id="callGoal" placeholder="her intent on this call — shared with chat (e.g. order a large cheese pizza to 123 Main St, pay cash)" autocomplete="off">
       <button id="callGo" class="go">📞 go</button>
     </div>
     <div id="callStatus" class="lstatus"></div>
@@ -228,9 +234,11 @@
       </div>
       <input id="agentFirst" placeholder="first thing she says when the call connects (blank = wait for them to speak)" autocomplete="off">
       <textarea id="agentPrompt" spellcheck="false" placeholder="her system prompt — who she is, how she talks, what she's called"></textarea>
-      <div class="phint">edits save to the ElevenLabs agent and apply from the next call.
-        Keep the <code>{{now}}</code> and <code>{{mission}}</code> placeholders — every call fills
-        them with the current Denver time and the mission you type above.</div>
+      <div class="phint">one brain, two surfaces: edits save to the ElevenLabs agent —
+        chat picks them up on her next reply, phone from the next call. Keep the
+        <code>{{now}}</code> and <code>{{mission}}</code> placeholders — they're filled with the
+        current Denver time and the intent box. The voice here and the 🎙 picker up top
+        are the same setting.</div>
       <div id="agentStatus" class="lstatus"></div>
     </details>
   </div>
@@ -291,6 +299,10 @@ function setMode(m) {
   if (!views[m]) m = "chat";
   mode = m;
   for (const k in views) views[k].style.display = (k === m) ? "" : "none";
+  // the ⚙ agent settings panel is shared — it follows you into chat or phone
+  const panel = document.getElementById("agentPanel");
+  const home = document.getElementById(m === "chat" ? "chatLauncher" : "phoneLauncher");
+  if (panel && home && panel.parentElement !== home) home.appendChild(panel);
   for (const b of tabBtns) b.classList.toggle("active", b.dataset.mode === m);
   if (m === "sms") smsTab.classList.remove("unread");
   if (m === "phone") phoneTab.classList.remove("unread");
@@ -777,7 +789,10 @@ function connect() {
       for (const d of m.deep || []) upsertDeep(d);
       if (!m.deepAvailable) interimEl.textContent = "⚠ deep tier disabled on server";
       renderVoices(m.voices, m.voice);
+      showIntent(m.intent || "");
       refreshPill();
+    } else if (m.type === "intent") {
+      showIntent(m.text || "");
     } else if (m.type === "user") {
       addBubble("me", m.text);
     } else if (m.type === "assistant_start") {
@@ -809,6 +824,9 @@ function connect() {
       renderVoices(m.voices, m.voice);
     } else if (m.type === "voice") {
       voiceSel.value = m.id;
+      // same voice everywhere: keep the agent panel's picker in step too
+      const av = document.getElementById("agentVoice");
+      if (av && av.options.length) av.value = m.id;
       if (voicePreviewPending) { voicePreviewPending = false; previewVoice(); }
     } else if (m.type === "call") {
       upsertCall(m);
@@ -901,6 +919,33 @@ async function placeCall() {
 callGo.onclick = placeCall;
 callGoal.addEventListener("keydown", e => { if (e.key === "Enter") placeCall(); });
 callNum.addEventListener("keydown", e => { if (e.key === "Enter") callGoal.focus(); });
+
+// ── shared intent: ONE objective — steers the chat brain and rides along as
+// the mission on every phone call. The two inputs mirror each other; edits
+// sync to the server (debounced) and fan out to every open tab.
+const chatIntent = document.getElementById("chatIntent");
+const chatLauncher = document.getElementById("chatLauncher");
+const phoneLauncher = document.getElementById("phoneLauncher");
+const intentInputs = [chatIntent, callGoal];
+let intentTimer = null;
+function showIntent(text) {
+  for (const el of intentInputs)
+    if (document.activeElement !== el && el.value !== text) el.value = text;
+}
+function pushIntent(now) {
+  clearTimeout(intentTimer);
+  const fire = () => send({ type: "intent", text: chatIntent.value.trim() });
+  if (now) fire(); else intentTimer = setTimeout(fire, 600);
+}
+for (const el of intentInputs) el.addEventListener("input", () => {
+  for (const o of intentInputs) if (o !== el) o.value = el.value;
+  pushIntent(false);
+});
+chatIntent.addEventListener("keydown", e => {
+  if (e.key === "Enter") { pushIntent(true); chatIntent.blur(); }
+});
+callGoal.addEventListener("blur", () => pushIntent(true));
+chatIntent.addEventListener("blur", () => pushIntent(true));
 
 // ── phone agent settings: voice / model / persona live on the ElevenLabs agent
 const agentPanel = document.getElementById("agentPanel");

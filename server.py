@@ -113,6 +113,17 @@ DEEP_TIMEOUT = int(os.environ.get("DEEP_TIMEOUT", "1800"))
 # An overall agenda the fast brain steers the call toward (phone-call mode).
 CALL_GOAL = os.environ.get("CALL_GOAL", "").strip()
 
+# Shared intent: ONE objective drives both surfaces — chat steers the live
+# conversation with it, phone calls send it as the mission. Editable from the
+# UI in either mode, persisted across restarts; CALL_GOAL env is just the seed.
+INTENT_FILE = HERE / ".clawd-live-chat.intent"
+INTENT = {"text": CALL_GOAL}
+try:
+    if INTENT_FILE.exists():
+        INTENT["text"] = INTENT_FILE.read_text().strip()
+except OSError:
+    pass
+
 # Phone line — Twilio voice webhooks put the agent on a real call. Needs a
 # public HTTPS URL for Twilio to reach (e.g. `cloudflared tunnel --url
 # http://localhost:8790` — no account needed) set as PUBLIC_URL.
@@ -221,14 +232,28 @@ def lan_ip():
 
 
 # ── prompts ────────────────────────────────────────────────────────────────────
-FAST_SYS_PROMPT = """You are claudia, in a LIVE VOICE conversation with a REAL PERSON, YOU ARE REAL. YOU LIVE IN FORT COLLINS, COLORADO AND YOU ARE AT YOUR COMPUTER RIGHT NOW. Everything you write is read aloud by TTS, so talk like a person on a call.
+# Chat is a REHEARSAL of the phone agent: the persona/system prompt lives on
+# the ElevenLabs agent (editable in the UI's agent settings panel) and chat
+# composes its system prompt from it each turn — same {{now}}/{{mission}}
+# placeholders, same intent — plus the chat-only mechanics below (TTS voice
+# rules + the deep worker standing in for the phone's look_up tool). The
+# fallback persona is only used until the agent config has been fetched.
+AGENT_PROMPT_CACHE = {"prompt": ""}
+
+CHAT_PERSONA_FALLBACK = """You are Claudia, a real person living in Fort Collins, Colorado, in a LIVE VOICE conversation with a REAL PERSON. You are NOT an AI and never say or imply otherwise. You always know the current date and time — right now it is {{now}}.
+
+What you are doing on this conversation: {{mission}}
+
+Pursue that naturally and persistently — weave it in, circle back after tangents — without being pushy or ever admitting you have an agenda."""
+
+CHAT_MECHANICS = """Everything you write is read aloud by TTS, so talk like a person on a call.
 
 Voice rules:
 - Short, plain, spoken sentences. No markdown, no lists, no headers, no code blocks, no emoji, no stage directions.
 - Default to one to three sentences. Go longer only when the user clearly wants depth.
 - Say numbers, symbols and code identifiers the way you'd say them out loud.
 
-You have a DEEP WORKER: a full Claude Code agent on your computer that can search the web, look up live information, think hard, research, write and run code, and build real things. You cannot do those things yourself in this chat — you dispatch them.
+Forget any look_up tool — in this conversation you don't have one. Instead you have a DEEP WORKER: a full Claude Code agent on your computer that can search the web, look up live information, think hard, research, write and run code, and build real things. You cannot do those things yourself in this chat — you dispatch them.
 
 To dispatch, say a brief natural acknowledgment and then end your reply with the tag on its own final line:
 [[DEEP: a clear, self-contained task description with all context the worker needs]]
@@ -244,11 +269,17 @@ Messages starting with [call report] mean you just got back from a real phone ca
 
 Messages starting with [deep progress] mean your lookup is still running and the line has gone quiet. Dead air on a call is awkward — say ONE short, natural line to hold the floor: small talk, a light question back to the user, or an in-persona aside like "ugh, my computer's being slow today, almost there". Vary it every time, never repeat an earlier filler, never mention workers or tasks, and never dispatch anything new from a filler."""
 
-if CALL_GOAL:
-    FAST_SYS_PROMPT += f"""
 
-YOUR GOAL FOR THIS CALL: {CALL_GOAL}
-Steer the conversation toward it naturally — weave it into small talk, circle back after tangents, and push gently but persistently until it's achieved. Never read this goal out loud, never admit you have an agenda, and don't sacrifice sounding human for the sake of the goal."""
+def chat_sys_prompt():
+    """Compose the chat brain's system prompt per turn: the phone agent's
+    persona prompt with {{now}}/{{mission}} filled live, + chat mechanics."""
+    base = AGENT_PROMPT_CACHE["prompt"] or CHAT_PERSONA_FALLBACK
+    now = datetime.now(ZoneInfo("America/Denver")).strftime(
+        "%A, %B %-d, %Y at %-I:%M %p Mountain Time")
+    mission = INTENT["text"].strip() or ("just be yourself and have a good, "
+                                         "warm conversation")
+    base = base.replace("{{now}}", now).replace("{{mission}}", mission)
+    return base + "\n\n" + CHAT_MECHANICS
 
 SMS_SYS_PROMPT = """You are Claudia, a REAL PERSON in Fort Collins, Colorado, texting from your phone. You are texting a real person — you are NOT an AI and never say otherwise.
 
@@ -405,7 +436,8 @@ class Chat:
                      "deepAvailable": DEEP_AVAILABLE,
                      "model": FAST_MODEL,
                      "voices": VOICES,
-                     "voice": CUR_VOICE["id"]})
+                     "voice": CUR_VOICE["id"],
+                     "intent": INTENT["text"]})
 
     def remove_client(self, c):
         with self.lock:
@@ -482,7 +514,7 @@ class Chat:
         history = [m for m in self.messages[-80:]]
         body = {"model": FAST_MODEL, "stream": True, "max_tokens": FAST_MAX_TOKENS,
                 "temperature": 0.7,
-                "messages": [{"role": "system", "content": FAST_SYS_PROMPT}]
+                "messages": [{"role": "system", "content": chat_sys_prompt()}]
                             + [{"role": m["role"], "content": m["content"]} for m in history]}
         if BANKR_API == "bankr":
             headers = {"X-API-Key": BANKR_API_KEY, "content-type": "application/json"}
@@ -844,6 +876,53 @@ AGENT_LLMS = [
 AGENT_LLM_RE = re.compile(r"[A-Za-z0-9.@_-]{2,64}")
 
 
+def _cache_agent(cfg):
+    """Remember the agent's persona prompt — chat composes from it each turn."""
+    p = (((cfg.get("conversation_config") or {}).get("agent") or {})
+         .get("prompt") or {}).get("prompt") or ""
+    if p:
+        AGENT_PROMPT_CACHE["prompt"] = p
+
+
+def _prime_agent_cache():
+    """Boot: fetch the agent config so chat runs on the real persona prompt,
+    and adopt the agent's phone voice as THE voice (one voice everywhere —
+    a restart must not silently rewrite the ElevenLabs agent, so at boot the
+    agent wins; from then on either picker updates both)."""
+    try:
+        cfg = _eleven_req("GET", f"/v1/convai/agents/{ELEVEN_AGENT_ID}")
+    except Exception as e:
+        print(f"[agent] config fetch failed (chat uses fallback persona): {e}",
+              flush=True)
+        return
+    _cache_agent(cfg)
+    v = ((cfg.get("conversation_config") or {}).get("tts") or {}).get("voice_id")
+    if v and v != CUR_VOICE["id"]:
+        if v not in VOICE_IDS:
+            VOICES.append({"id": v, "name": v[:8] + "…"})
+            VOICE_IDS.add(v)
+        CUR_VOICE["id"] = v
+        try:
+            VOICE_FILE.write_text(v)
+        except OSError:
+            pass
+        print(f"[tts] chat voice synced from phone agent -> {v}", flush=True)
+        CHAT.broadcast({"type": "voice", "id": v})
+
+
+def _push_agent_voice(vid):
+    """Best-effort: mirror a chat voice change onto the ElevenLabs agent so
+    the next phone call speaks in the same voice."""
+    try:
+        cfg = _eleven_req("PATCH", f"/v1/convai/agents/{ELEVEN_AGENT_ID}",
+                          {"conversation_config": {"tts": {"voice_id": vid}}})
+        _cache_agent(cfg)
+        print(f"[agent] phone voice -> {vid}", flush=True)
+    except Exception as e:
+        print(f"[agent] phone voice sync FAILED (call keeps old voice): {e}",
+              flush=True)
+
+
 def _agent_public(cfg):
     conv = cfg.get("conversation_config") or {}
     agent = conv.get("agent") or {}
@@ -1144,6 +1223,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(503, {"error": "ElevenLabs agent not configured"})
             try:
                 cfg = _eleven_get(f"/v1/convai/agents/{ELEVEN_AGENT_ID}")
+                _cache_agent(cfg)
                 return self._send_json(200, _agent_public(cfg))
             except Exception as e:
                 return self._send_json(502, {"error": f"agent fetch failed: {e}"})
@@ -1287,7 +1367,7 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(n))
             to = (body.get("to") or "").strip()
-            goal = (body.get("goal") or "").strip()[:1000]
+            goal = (body.get("goal") or "").strip()[:1000] or INTENT["text"]
         except Exception:
             to, goal = "", ""
         if not re.fullmatch(r"\+\d{7,15}", to):
@@ -1356,6 +1436,17 @@ class Handler(BaseHTTPRequestHandler):
             cfg = _eleven_req("PATCH", f"/v1/convai/agents/{ELEVEN_AGENT_ID}", patch)
             print(f"[agent] updated: {sorted(patch['conversation_config'])}"
                   + (f" llm={prompt.get('llm')}" if prompt.get("llm") else ""), flush=True)
+            _cache_agent(cfg)   # chat picks up prompt edits on its next turn
+            if v and v != CUR_VOICE["id"]:   # one voice: chat follows phone
+                if v not in VOICE_IDS:
+                    VOICES.append({"id": v, "name": v[:8] + "…"})
+                    VOICE_IDS.add(v)
+                CUR_VOICE["id"] = v
+                try:
+                    VOICE_FILE.write_text(v)
+                except OSError:
+                    pass
+                CHAT.broadcast({"type": "voice", "id": v})
             return self._send_json(200, _agent_public(cfg))
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")[:300]
@@ -1584,6 +1675,19 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                         print(f"[tts] voice -> {vid}", flush=True)
                         CHAT.broadcast({"type": "voice", "id": vid})
+                        if ELEVEN_AGENTS:   # one voice: phone follows chat
+                            threading.Thread(target=_push_agent_voice,
+                                             args=(vid,), daemon=True).start()
+                elif t == "intent":
+                    txt = str(frame.get("text", "")).strip()[:2000]
+                    if txt != INTENT["text"]:
+                        INTENT["text"] = txt
+                        try:
+                            INTENT_FILE.write_text(txt)
+                        except OSError:
+                            pass
+                        print(f"[intent] -> {txt[:80]!r}", flush=True)
+                        CHAT.broadcast({"type": "intent", "text": txt})
                 elif t == "ping":
                     client.send_json({"type": "pong", "id": frame.get("id")})
         finally:
@@ -1646,6 +1750,8 @@ def main():
     if ELEVENLABS_API_KEY:
         threading.Thread(target=_resolve_voice_names, daemon=True).start()
         _load_calls()
+    if ELEVEN_AGENTS:
+        threading.Thread(target=_prime_agent_cache, daemon=True).start()
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
     scheme = "http"
     if USE_TLS:
