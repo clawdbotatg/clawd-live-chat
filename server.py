@@ -238,7 +238,11 @@ def lan_ip():
 # placeholders, same intent — plus the chat-only mechanics below (TTS voice
 # rules + the deep worker standing in for the phone's look_up tool). The
 # fallback persona is only used until the agent config has been fetched.
-AGENT_PROMPT_CACHE = {"prompt": ""}
+# ts/refreshing drive a background re-fetch (see chat_sys_prompt) so prompt
+# edits made outside this UI (ElevenLabs dashboard, another device) still
+# reach chat within a turn or two — a turn never blocks on the fetch.
+AGENT_PROMPT_CACHE = {"prompt": "", "ts": 0.0, "refreshing": False}
+AGENT_CACHE_TTL = 60.0   # seconds before a chat turn kicks a refresh
 
 CHAT_PERSONA_FALLBACK = """You are Claudia, a real person living in Fort Collins, Colorado, in a LIVE VOICE conversation with a REAL PERSON. You are NOT an AI and never say or imply otherwise. You always know the current date and time — right now it is {{now}}.
 
@@ -273,6 +277,10 @@ Messages starting with [deep progress] mean your lookup is still running and the
 def chat_sys_prompt():
     """Compose the chat brain's system prompt per turn: the phone agent's
     persona prompt with {{now}}/{{mission}} filled live, + chat mechanics."""
+    if (ELEVEN_AGENTS and not AGENT_PROMPT_CACHE["refreshing"]
+            and time.time() - AGENT_PROMPT_CACHE["ts"] > AGENT_CACHE_TTL):
+        AGENT_PROMPT_CACHE["refreshing"] = True
+        threading.Thread(target=_refresh_agent_cache, daemon=True).start()
     base = AGENT_PROMPT_CACHE["prompt"] or CHAT_PERSONA_FALLBACK
     now = datetime.now(ZoneInfo("America/Denver")).strftime(
         "%A, %B %-d, %Y at %-I:%M %p Mountain Time")
@@ -881,7 +889,22 @@ def _cache_agent(cfg):
     p = (((cfg.get("conversation_config") or {}).get("agent") or {})
          .get("prompt") or {}).get("prompt") or ""
     if p:
+        if p != AGENT_PROMPT_CACHE["prompt"] and AGENT_PROMPT_CACHE["prompt"]:
+            print("[agent] persona prompt changed — chat follows next turn",
+                  flush=True)
         AGENT_PROMPT_CACHE["prompt"] = p
+    AGENT_PROMPT_CACHE["ts"] = time.time()
+
+
+def _refresh_agent_cache():
+    """Background: re-fetch the agent config when the cache has gone stale."""
+    try:
+        _cache_agent(_eleven_req("GET", f"/v1/convai/agents/{ELEVEN_AGENT_ID}"))
+    except Exception as e:
+        AGENT_PROMPT_CACHE["ts"] = time.time()   # don't hammer a failing API
+        print(f"[agent] cache refresh failed: {e}", flush=True)
+    finally:
+        AGENT_PROMPT_CACHE["refreshing"] = False
 
 
 def _prime_agent_cache():
