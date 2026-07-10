@@ -683,6 +683,8 @@ function makeRec() {
     if (e.error === "not-allowed") {
       micOn = false; orb.className = "off";
       interimEl.textContent = "⚠ mic permission denied — type instead";
+    } else if (e.error === "aborted" && selfAbort) {
+      selfAbort = false;               // we did this ourselves — not a rival
     } else if (e.error === "aborted" && ++abortStreak >= 4) {
       // something (another window or app) keeps yanking the recognizer away
       // the instant we start it. Fighting forever chops speech into garbage —
@@ -707,9 +709,13 @@ function startRec() {
   try { rec.start(); recAlive = true; } catch (e) {}
   refreshPill();
 }
+let selfAbort = false;   // our own stopRec fires an 'aborted' error — don't count it
 function stopRec() {
   // abort (not stop): discard half-heard results instead of finalizing them
-  if (rec && recAlive) try { rec.abort(); } catch (e) {}
+  if (rec && recAlive) {
+    selfAbort = true;
+    try { rec.abort(); } catch (e) {}
+  }
   recAlive = false;
   interimEl.textContent = "";
   refreshPill();
