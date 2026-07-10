@@ -526,6 +526,7 @@ function enqueueSpeech(msg) {
   pumpAudio();
 }
 
+let activePlays = 0;   // live Audio elements actually playing chat TTS
 async function pumpAudio() {
   if (playing) return;
   playing = true;
@@ -537,12 +538,16 @@ async function pumpAudio() {
     if (!blob || item.gen !== liveGen || cancelledGens.has(item.gen)) continue;
     recentSpoken = (recentSpoken + " " + norm(item.text)).slice(-600);
     const url = URL.createObjectURL(blob);
+    activePlays++;
+    if (activePlays > 1) diag("audio-overlap", { active: activePlays, text: item.text.slice(0, 50) });
+    diag("audio-play", { gen: item.gen, seq: item.seq, text: item.text.slice(0, 50) });
     await new Promise(res => {
       currentAudio = new Audio(url);
       currentAudio.onended = res;
       currentAudio.onerror = res;
       currentAudio.play().catch(res);
     });
+    activePlays--;
     URL.revokeObjectURL(url);
     currentAudio = null;
   }
@@ -664,6 +669,13 @@ function makeRec() {
         diag("final-echo-dropped", { text: text.slice(0, 80), playing });
         return;
       }
+      // real Chrome sometimes delivers the same final twice back-to-back —
+      // two identical turns sound like two echoing voices answering
+      if (text === lastFinalText && Date.now() - lastFinalAt < 2500) {
+        diag("final-duplicate-dropped", { text: text.slice(0, 60) });
+        return;
+      }
+      lastFinalText = text; lastFinalAt = Date.now();
       if (playing) bargeIn();
       diag("final-accepted", { text: text.slice(0, 80) });
       sendUser(text);
@@ -700,6 +712,7 @@ function makeRec() {
   return r;
 }
 let lastAudioEnd = 0;
+let lastFinalText = "", lastFinalAt = 0;
 function genRecently() { return Date.now() - lastAudioEnd < 1200; }
 
 function startRec() {
