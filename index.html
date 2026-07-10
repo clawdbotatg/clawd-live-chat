@@ -476,7 +476,10 @@ if (micBus) micBus.onmessage = ev => {
     interimEl.textContent = "mic off — phone/sms mode is active in another tab";
   }
 };
-function claimMic() { if (micBus) micBus.postMessage({ type: "claim", id: TAB_ID }); }
+function claimMic() {
+  if (micBus) micBus.postMessage({ type: "claim", id: TAB_ID });  // same profile: instant
+  send({ type: "claim", tab: TAB_ID });                           // other profiles/browsers: via server
+}
 function micOffEverywhere() { if (micBus) micBus.postMessage({ type: "micoff", id: TAB_ID }); }
 
 function updateCallHold() {
@@ -622,7 +625,8 @@ function looksLikeEcho(text) {
 // ── speech recognition (Web Speech API) ──────────────────────────────────────
 // diag: recognition lifecycle + every dropped result, streamed to the server
 // log — so "STT is terrible" debugs from evidence, not theory.
-function diag(ev, extra) { send(Object.assign({ type: "diag", ev }, extra || {})); }
+function diag(ev, extra) { send(Object.assign({ type: "diag", ev, id: TAB_ID.slice(0, 6) }, extra || {})); }
+let abortStreak = 0;   // consecutive instantly-aborted recognition sessions
 function makeRec() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) { interimEl.textContent = "⚠ no Web Speech API in this browser — type instead"; return null; }
@@ -632,6 +636,7 @@ function makeRec() {
   r.lang = "en-US";
   r.onstart = () => diag("rec-start");
   r.onresult = ev => {
+    abortStreak = 0;                       // real audio is flowing — mic is healthy
     if (!micOn || !micAllowed()) {         // a held/background tab is deaf
       diag("result-dropped-guard", { micOn, allowed: micAllowed(), mode });
       return;
@@ -678,6 +683,16 @@ function makeRec() {
     if (e.error === "not-allowed") {
       micOn = false; orb.className = "off";
       interimEl.textContent = "⚠ mic permission denied — type instead";
+    } else if (e.error === "aborted" && ++abortStreak >= 4) {
+      // something (another window or app) keeps yanking the recognizer away
+      // the instant we start it. Fighting forever chops speech into garbage —
+      // give up VISIBLY instead and let the user reclaim deliberately.
+      diag("mic-gave-up", { streak: abortStreak });
+      abortStreak = 0;
+      micOn = false;
+      syncMic();
+      interimEl.textContent = "⚠ the mic keeps being grabbed by another window or app — "
+        + "close whatever else is listening, then tap the orb";
     }
   };
   return r;
@@ -778,6 +793,14 @@ function connect() {
       if (voicePreviewPending) { voicePreviewPending = false; previewVoice(); }
     } else if (m.type === "call") {
       upsertCall(m);
+    } else if (m.type === "claim") {
+      // server-relayed mic claim from another window (any profile/browser)
+      if (m.tab !== TAB_ID && micOn) {
+        diag("mic-lost-to-claim-ws");
+        micOn = false;
+        syncMic();
+        interimEl.textContent = "mic moved to another window — tap the orb to take it back";
+      }
     } else if (m.type === "micoff") {
       // server-relayed: some client somewhere entered phone/sms mode.
       // Reaches every profile/browser — unlike the BroadcastChannel.

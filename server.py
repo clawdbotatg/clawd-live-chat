@@ -1540,6 +1540,10 @@ class Handler(BaseHTTPRequestHandler):
                     extra = {k: v for k, v in frame.items() if k not in ("type", "ev")}
                     print(f"[diag] {frame.get('ev')}"
                           + (f" {json.dumps(extra)[:160]}" if extra else ""), flush=True)
+                elif t == "claim":
+                    # a window took the mic: every other window lets go,
+                    # across profiles/browsers (BroadcastChannel can't reach those)
+                    CHAT.broadcast({"type": "claim", "tab": frame.get("tab")})
                 elif t == "micoff":
                     # a client entered phone/sms mode: order EVERY connected
                     # client (any tab, window, profile, browser) to drop its mic
