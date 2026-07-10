@@ -137,6 +137,13 @@ MEDIA_WSS     = (PUBLIC_URL.replace("https://", "wss://").replace("http://", "ws
 # is wired at Twilio (voice webhook → api.elevenlabs.io) — nothing here handles it.
 ELEVEN_AGENT_ID = os.environ.get("ELEVEN_AGENT_ID", "")
 ELEVEN_PHONE_ID = os.environ.get("ELEVEN_PHONE_ID", "")
+# When ELEVEN_PHONE_ID is a verified caller ID (a real personal number), a call
+# where From == To hits the carrier's dial-your-own-number-for-voicemail shortcut
+# ("enter your password") instead of ringing. So: ELEVEN_PHONE_NUMBER = the E.164
+# number behind ELEVEN_PHONE_ID, ELEVEN_PHONE_ID_ALT = a different phone entry
+# (the Twilio number) used automatically for calls TO that number.
+ELEVEN_PHONE_NUMBER = os.environ.get("ELEVEN_PHONE_NUMBER", "")
+ELEVEN_PHONE_ID_ALT = os.environ.get("ELEVEN_PHONE_ID_ALT", "")
 ELEVEN_AGENTS   = bool(ELEVEN_AGENT_ID and ELEVEN_PHONE_ID and ELEVENLABS_API_KEY)
 # Shared secret the ElevenLabs look_up tool sends (?k=) so only the agent can
 # reach our deep worker over the public /tool/lookup route.
@@ -736,8 +743,13 @@ def place_call(to, mission=""):
     """Place an outbound voice call. Via ElevenLabs Agents when configured
     (their platform runs the whole call); mission rides in as a dynamic var."""
     if ELEVEN_AGENTS:
+        phone_id = ELEVEN_PHONE_ID
+        digits = lambda n: "".join(c for c in n if c.isdigit())[-10:]
+        if (ELEVEN_PHONE_ID_ALT and ELEVEN_PHONE_NUMBER
+                and digits(to) == digits(ELEVEN_PHONE_NUMBER)):
+            phone_id = ELEVEN_PHONE_ID_ALT   # From==To would land in voicemail login
         body = {"agent_id": ELEVEN_AGENT_ID,
-                "agent_phone_number_id": ELEVEN_PHONE_ID,
+                "agent_phone_number_id": phone_id,
                 "to_number": to}
         # Give her the current time so time/date/timezone questions need no lookup.
         now = datetime.now(ZoneInfo("America/Denver")).strftime(
