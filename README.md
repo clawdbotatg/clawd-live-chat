@@ -33,6 +33,10 @@ you (voice) ── Web Speech STT ──▶ FAST BRAIN (Haiku via Bankr, streams
 python3 server.py      # → http://127.0.0.1:8790/
 ```
 
+Or as a desktop app: `./make_desktop_app.sh` builds **Clawd Live.app** on the
+Desktop — double-click starts the server if it's down and opens a standalone
+window (no daemon; first click after a reboot boots it).
+
 Zero config on a box with clawd-harness set up: creds fall back to
 `~/clawd-harness/.clawd-harness.env` (`BANKR_*`, `ELEVENLABS_*`). Otherwise
 `cp .clawd-live-chat.env.example .clawd-live-chat.env` and fill in. The deep
