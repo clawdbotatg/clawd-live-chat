@@ -281,6 +281,29 @@ Messages starting with [call report] mean you just got back from a real phone ca
 Messages starting with [deep progress] mean your lookup is still running and the line has gone quiet. Dead air on a call is awkward — say ONE short, natural line to hold the floor: small talk, a light question back to the user, or an in-persona aside like "ugh, my computer's being slow today, almost there". Vary it every time, never repeat an earlier filler, never mention workers or tasks, and never dispatch anything new from a filler."""
 
 
+def mission_framing(mission, surface):
+    """One mission, two surfaces, SAME semantics: append the facts the model
+    can't infer on each surface. Chat is the rehearsal room for the call — the
+    person present IS the mission counterpart on both, so a mission tested on
+    the live-chat page behaves identically when it rides out on a real call.
+    (Born of a real failure: 'call Jimmy about dinner' → she asked the person
+    in front of her how to get ahold of Jimmy.)"""
+    if surface == "call":
+        return (mission
+                + " This call is already connected: assume the person answering "
+                "is the one you dialed, and speak to them as that person, unless "
+                "it's clearly voicemail or they say otherwise."
+                " Once your objective is settled either way (a clear yes, a "
+                "clear no, or they genuinely can't answer), wrap up warmly like "
+                "a normal person and end the call.")
+    return (mission
+            + " You are already live with your counterpart: the person talking "
+            "to you RIGHT NOW is the person this mission is about — pursue it "
+            "with them directly. You never need to place a call or go find "
+            "them; if the mission says to call someone, this conversation IS "
+            "that call.")
+
+
 def chat_sys_prompt():
     """Compose the chat brain's system prompt per turn: the phone agent's
     persona prompt with {{now}}/{{mission}} filled live, + chat mechanics."""
@@ -291,8 +314,9 @@ def chat_sys_prompt():
     base = AGENT_PROMPT_CACHE["prompt"] or CHAT_PERSONA_FALLBACK
     now = datetime.now(ZoneInfo("America/Denver")).strftime(
         "%A, %B %-d, %Y at %-I:%M %p Mountain Time")
-    mission = INTENT["text"].strip() or ("just be yourself and have a good, "
-                                         "warm conversation")
+    mission = INTENT["text"].strip()
+    mission = (mission_framing(mission, "chat") if mission
+               else "just be yourself and have a good, warm conversation")
     base = base.replace("{{now}}", now).replace("{{mission}}", mission)
     return base + "\n\n" + CHAT_MECHANICS
 
@@ -890,21 +914,7 @@ def place_call(to, mission=""):
             "%A, %B %-d, %Y at %-I:%M %p Mountain Time")
         dyn = {"now": now}
         if mission:
-            # Two facts she can't infer, stated once so mission authors don't
-            # have to phrase things defensively: (1) the world-state — this
-            # outbound call is already connected and the answering voice is the
-            # person she dialed (observed failure without it: "I'm trying to
-            # reach Austin" said TO Austin — "you are calling X" names the task,
-            # not the voice); (2) the exit condition — settle the objective,
-            # then end the call instead of drifting into small talk.
-            dyn["mission"] = (mission
-                              + " This call is already connected: assume the person "
-                              "answering is the one you dialed, and speak to them as "
-                              "that person, unless it's clearly voicemail or they "
-                              "say otherwise."
-                              " Once your objective is settled either way (a clear "
-                              "yes, a clear no, or they genuinely can't answer), "
-                              "wrap up warmly like a normal person and end the call.")
+            dyn["mission"] = mission_framing(mission, "call")
         body["conversation_initiation_client_data"] = {"dynamic_variables": dyn}
         req = urllib.request.Request(
             "https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
