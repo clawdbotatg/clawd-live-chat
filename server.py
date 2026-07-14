@@ -890,10 +890,21 @@ def place_call(to, mission=""):
             "%A, %B %-d, %Y at %-I:%M %p Mountain Time")
         dyn = {"now": now}
         if mission:
-            # Nudge her to actually close the loop: a mission call should end
-            # with a definite outcome, not drift into open-ended small talk.
-            dyn["mission"] = (mission + " Once this objective is settled either way "
-                              "(a clear yes, a clear no, or they genuinely can't answer), "
+            # Two stamped-on framings so mission authors don't have to get the
+            # phrasing right: (1) whoever answers IS the person you called —
+            # observed failure: "I'm trying to reach Austin" said TO Austin,
+            # because "you are calling X" names the task but not the voice;
+            # (2) close the loop — a mission call should end with a definite
+            # outcome, not drift into open-ended small talk.
+            dyn["mission"] = (mission
+                              + " You placed this call and it just connected: the "
+                              "person speaking to you IS the person you called — "
+                              "greet them and talk to them directly as that person. "
+                              "Never say you are 'trying to reach' them; you already "
+                              "have them on the line. Only change tack if they say "
+                              "you have the wrong person or it's clearly voicemail."
+                              " Once this objective is settled either way (a clear "
+                              "yes, a clear no, or they genuinely can't answer), "
                               "wrap up warmly like a normal person and end the call.")
         body["conversation_initiation_client_data"] = {"dynamic_variables": dyn}
         req = urllib.request.Request(
