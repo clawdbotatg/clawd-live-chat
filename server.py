@@ -276,32 +276,24 @@ Dispatch for: live or current information, looking anything up, building or chan
 
 While a deep task runs, keep chatting normally. Messages starting with [deep result] are the worker reporting back — relay the substance to the user conversationally in a few spoken sentences (never read paths or raw output verbatim unless asked).
 
-Messages starting with [call report] mean you just got back from a real phone call you made on the user's behalf. Tell the user how it went in your own words, leading with the direct answer to whatever they sent you to find out — like a friend reporting back, not a form being read.
-
 Messages starting with [deep progress] mean your lookup is still running and the line has gone quiet. Dead air on a call is awkward — say ONE short, natural line to hold the floor: small talk, a light question back to the user, or an in-persona aside like "ugh, my computer's being slow today, almost there". Vary it every time, never repeat an earlier filler, never mention workers or tasks, and never dispatch anything new from a filler."""
 
 
-def mission_framing(mission, surface):
-    """One mission, two surfaces, SAME semantics: append the facts the model
-    can't infer on each surface. Chat is the rehearsal room for the call — the
-    person present IS the mission counterpart on both, so a mission tested on
-    the live-chat page behaves identically when it rides out on a real call.
+def mission_framing(mission):
+    """One mission, one framing, VERBATIM on both surfaces. The chat page is a
+    call simulator: she's told the exact same thing she'll be told on the real
+    call — the conversation IS the connected call, the person present IS the
+    person dialed — so a mission that rehearses well in chat plays out the
+    same way on the phone, wrap-up and all. No chat variant, no call variant.
     (Born of a real failure: 'call Jimmy about dinner' → she asked the person
     in front of her how to get ahold of Jimmy.)"""
-    if surface == "call":
-        return (mission
-                + " This call is already connected: assume the person answering "
-                "is the one you dialed, and speak to them as that person, unless "
-                "it's clearly voicemail or they say otherwise."
-                " Once your objective is settled either way (a clear yes, a "
-                "clear no, or they genuinely can't answer), wrap up warmly like "
-                "a normal person and end the call.")
     return (mission
-            + " You are already live with your counterpart: the person talking "
-            "to you RIGHT NOW is the person this mission is about — pursue it "
-            "with them directly. You never need to place a call or go find "
-            "them; if the mission says to call someone, this conversation IS "
-            "that call.")
+            + " This call is already connected: assume the person you are "
+            "talking to is the one you called, and speak to them as that "
+            "person, unless it's clearly voicemail or they say otherwise."
+            " Once your objective is settled either way (a clear yes, a "
+            "clear no, or they genuinely can't answer), wrap up warmly like "
+            "a normal person and end the call.")
 
 
 def chat_sys_prompt():
@@ -315,7 +307,7 @@ def chat_sys_prompt():
     now = datetime.now(ZoneInfo("America/Denver")).strftime(
         "%A, %B %-d, %Y at %-I:%M %p Mountain Time")
     mission = INTENT["text"].strip()
-    mission = (mission_framing(mission, "chat") if mission
+    mission = (mission_framing(mission) if mission
                else "just be yourself and have a good, warm conversation")
     base = base.replace("{{now}}", now).replace("{{mission}}", mission)
     return base + "\n\n" + CHAT_MECHANICS
@@ -576,7 +568,7 @@ class Chat:
         if live:   # she's on the phone — one conversation at a time
             self.broadcast({"type": "notice",
                             "text": f"📞 she's on a call with {live[0].get('to')} — "
-                                    "she'll report back here when it ends"})
+                                    "watch it live on the phone tab"})
             return
         self.cancel_current()                       # new utterance interrupts
         self.last_activity = time.time()
@@ -914,7 +906,7 @@ def place_call(to, mission=""):
             "%A, %B %-d, %Y at %-I:%M %p Mountain Time")
         dyn = {"now": now}
         if mission:
-            dyn["mission"] = mission_framing(mission, "call")
+            dyn["mission"] = mission_framing(mission)
         body["conversation_initiation_client_data"] = {"dynamic_variables": dyn}
         req = urllib.request.Request(
             "https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
@@ -1197,13 +1189,14 @@ def watch_call(conversation_id):
     CHAT.broadcast({"type": "call", **_call_public(rec)})
     print(f"[call] debrief {conversation_id} ({rec.get('to')}): "
           f"{(rec['answer'] or '')[:120]!r}", flush=True)
-    # She walks back into the room and tells you how it went: the debrief
-    # re-enters the browser conversation as a spoken turn (deep-result pattern).
-    inject = (f"[call report] You just hung up a real phone call to {rec.get('to')}."
-              + (f" Your mission was: {rec.get('goal')}" if rec.get("goal") else "")
-              + f"\nDebrief: {rec.get('answer') or rec.get('summary') or 'no details'}")
-    CHAT.messages.append({"role": "user", "content": inject, "kind": "call"})
-    CHAT._enqueue("turn")
+    # Chat is a call SIMULATOR, not her assistant desk: the debrief lives on
+    # the phone tab's call card and surfaces in chat only as a notice — it
+    # never becomes conversation context, so the next rehearsal starts from
+    # the same blank slate a real call would. (The old "she walks back into
+    # the room and tells you" injection is deliberately gone.)
+    CHAT.broadcast({"type": "notice",
+                    "text": f"📞 call to {rec.get('to')} ended — "
+                            f"{rec.get('answer') or rec.get('summary') or 'no details'}"})
 
 
 def start_call_watch(conversation_id, to, goal):
