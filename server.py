@@ -890,20 +890,19 @@ def place_call(to, mission=""):
             "%A, %B %-d, %Y at %-I:%M %p Mountain Time")
         dyn = {"now": now}
         if mission:
-            # Two stamped-on framings so mission authors don't have to get the
-            # phrasing right: (1) whoever answers IS the person you called —
-            # observed failure: "I'm trying to reach Austin" said TO Austin,
-            # because "you are calling X" names the task but not the voice;
-            # (2) close the loop — a mission call should end with a definite
-            # outcome, not drift into open-ended small talk.
+            # Two facts she can't infer, stated once so mission authors don't
+            # have to phrase things defensively: (1) the world-state — this
+            # outbound call is already connected and the answering voice is the
+            # person she dialed (observed failure without it: "I'm trying to
+            # reach Austin" said TO Austin — "you are calling X" names the task,
+            # not the voice); (2) the exit condition — settle the objective,
+            # then end the call instead of drifting into small talk.
             dyn["mission"] = (mission
-                              + " You placed this call and it just connected: the "
-                              "person speaking to you IS the person you called — "
-                              "greet them and talk to them directly as that person. "
-                              "Never say you are 'trying to reach' them; you already "
-                              "have them on the line. Only change tack if they say "
-                              "you have the wrong person or it's clearly voicemail."
-                              " Once this objective is settled either way (a clear "
+                              + " This call is already connected: assume the person "
+                              "answering is the one you dialed, and speak to them as "
+                              "that person, unless it's clearly voicemail or they "
+                              "say otherwise."
+                              " Once your objective is settled either way (a clear "
                               "yes, a clear no, or they genuinely can't answer), "
                               "wrap up warmly like a normal person and end the call.")
         body["conversation_initiation_client_data"] = {"dynamic_variables": dyn}
