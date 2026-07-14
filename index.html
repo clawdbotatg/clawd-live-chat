@@ -189,6 +189,8 @@
   </nav>
   <span id="pill">connecting…</span>
   <span id="build" title="build this tab is running — must match the latest commit"></span>
+  <a id="dbglink" href="/debug" target="_blank" title="LLM debug — every prompt in &amp; out"
+     style="text-decoration:none;font-size:13px">🔬</a>
   <div id="deepbar"></div>
   <select id="voiceSel" title="TTS voice" style="display:none"></select>
   <button id="reset" title="clear conversation">reset</button>
@@ -270,6 +272,7 @@
 const qs = new URLSearchParams(location.search);
 const TOKEN = qs.get("t") || "";
 const tok = TOKEN ? `?t=${encodeURIComponent(TOKEN)}` : "";
+document.getElementById("dbglink").href = "/debug" + tok;
 
 const chatEl = document.getElementById("chat");
 const pill = document.getElementById("pill");

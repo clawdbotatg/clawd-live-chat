@@ -304,6 +304,81 @@ SPOKEN SUMMARY:
 followed by two to four short plain-prose sentences (no markdown) that a voice assistant will read aloud, mentioning where any files landed."""
 
 
+# ── LLM debug log — every prompt that goes into any LLM, with full context ─────
+# Ring buffer in memory + JSONL on disk (gitignored) so a restart doesn't eat
+# the evidence. Browsable at /debug (list) + /debug/llm/<id>.json (full entry).
+LLM_LOG_MAX = int(os.environ.get("LLM_LOG_MAX", "400"))
+LLM_LOG_FILE = HERE / ".clawd-live-chat.llmlog.jsonl"
+LLM_LOG = []                 # oldest → newest, capped at LLM_LOG_MAX
+LLM_LOG_LOCK = threading.Lock()
+LLM_SEQ = 0
+
+
+def log_llm(kind, request, response, error=None, elapsed=None, meta=None):
+    """Record one LLM call: the exact request payload and what came back.
+    `request` is the full body for gateway calls ({model, messages, …}) or a
+    {prompt, append_system_prompt, …} dict for deep-worker (`claude -p`) runs."""
+    global LLM_SEQ
+    entry = {"kind": kind, "ts": time.time(),
+             "request": request, "response": response,
+             "error": str(error) if error else None,
+             "elapsed": round(elapsed, 2) if elapsed is not None else None,
+             "meta": meta or {}}
+    with LLM_LOG_LOCK:
+        LLM_SEQ += 1
+        entry["id"] = LLM_SEQ
+        LLM_LOG.append(entry)
+        del LLM_LOG[:-LLM_LOG_MAX]
+        try:
+            with LLM_LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError as e:
+            print(f"[llmlog] persist failed: {e}", flush=True)
+
+
+def _load_llm_log():
+    """Boot: reload the JSONL tail, trim the file to the same cap."""
+    global LLM_SEQ
+    try:
+        lines = LLM_LOG_FILE.read_text(encoding="utf-8").splitlines()[-LLM_LOG_MAX:]
+    except OSError:
+        return
+    for ln in lines:
+        try:
+            LLM_LOG.append(json.loads(ln))
+        except Exception:
+            continue
+    if LLM_LOG:
+        LLM_SEQ = max(e.get("id", 0) for e in LLM_LOG)
+        try:
+            LLM_LOG_FILE.write_text("\n".join(json.dumps(e) for e in LLM_LOG)
+                                    + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        print(f"[llmlog] {len(LLM_LOG)} past LLM call(s) loaded", flush=True)
+
+
+def _llm_public(e):
+    """Slim list-view slice; the full entry ships only when a row is expanded."""
+    req = e.get("request") or {}
+    msgs = req.get("messages")
+    if msgs:
+        chars = sum(len(str(m.get("content") or "")) for m in msgs)
+        prompt_prev = str(msgs[-1].get("content") or "")
+        n = len(msgs)
+    else:
+        prompt_prev = str(req.get("prompt") or "")
+        chars, n = len(prompt_prev), 1
+    return {"id": e["id"], "ts": e["ts"], "kind": e["kind"],
+            "model": req.get("model")
+                     or ("claude -p" if e["kind"] in ("deep", "lookup") else "?"),
+            "msgs": n, "chars": chars,
+            "prompt": prompt_prev[-260:],
+            "response": (e.get("response") or "")[:260],
+            "error": e.get("error"), "elapsed": e.get("elapsed"),
+            "meta": e.get("meta") or {}}
+
+
 # ── websocket framing (lifted from clawd-harness) ──────────────────────────────
 def ws_send(wfile, lock, data, opcode=0x1):
     payload = data.encode("utf-8") if isinstance(data, str) else data
@@ -532,6 +607,8 @@ class Chat:
         req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                      headers=headers, method="POST")
         interrupted = False
+        t0 = time.time()
+        stream_err = None
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 for raw in resp:
@@ -556,6 +633,7 @@ class Chat:
                     for sent in cutter.feed(delta):
                         speak(sent)
         except Exception as e:
+            stream_err = e
             self.broadcast({"type": "error", "text": f"fast brain: {e}"})
             print(f"[fast] stream error: {e}", flush=True)
 
@@ -575,6 +653,8 @@ class Chat:
         self.last_activity = time.time()
         self.broadcast({"type": "assistant_done", "gen": gen,
                         "text": spoken, "interrupted": interrupted})
+        log_llm("chat", body, full + (" (interrupted)" if interrupted else ""),
+                error=stream_err, elapsed=time.time() - t0, meta={"gen": gen})
 
         if task_text:
             self._dispatch_deep(task_text)
@@ -623,6 +703,9 @@ class Chat:
     def _run_deep(self, tid, task):
         rec = self.deep_tasks[tid]
         DEEP_CWD.mkdir(parents=True, exist_ok=True)
+        req_log = {"prompt": task, "append_system_prompt": DEEP_APPEND_PROMPT,
+                   "session_id": self.deep_session_id, "args": DEEP_ARGS,
+                   "cwd": str(DEEP_CWD)}
         try:
             out = deep_run_turn(
                 task,
@@ -646,6 +729,8 @@ class Chat:
                 detail = text.strip()[:1200]
             rec.update(status="done", summary=summary,
                        elapsed=round(time.time() - rec["started"]))
+            log_llm("deep", req_log, text, elapsed=time.time() - rec["started"],
+                    meta={"tid": tid})
             inject = (f"[deep result] Task: {task}\n"
                       f"Worker summary: {summary}\n"
                       + (f"Extra context (not to be read aloud): {detail}" if detail else ""))
@@ -653,6 +738,8 @@ class Chat:
         except Exception as e:
             rec.update(status="error", summary=str(e)[:300],
                        elapsed=round(time.time() - rec["started"]))
+            log_llm("deep", req_log, None, error=e,
+                    elapsed=time.time() - rec["started"], meta={"tid": tid})
             inject = (f"[deep result] Task: {task}\nThe worker FAILED: {e}. "
                       f"Tell the user briefly and offer to retry.")
             print(f"[deep {tid}] error: {e}", flush=True)
@@ -1014,7 +1101,7 @@ def debrief_answer(goal, transcript_lines, summary):
             [{"role": "system", "content": DEBRIEF_SYS},
              {"role": "user", "content": f"MISSION: {goal}\n\nTRANSCRIPT:\n"
                                          + "\n".join(transcript_lines)}],
-            max_tokens=250, temperature=0.2)
+            max_tokens=250, temperature=0.2, kind="debrief", meta={"goal": goal})
     except Exception as e:
         print(f"[call] debrief LLM failed ({e}) — falling back to summary", flush=True)
         return summary or "(call ended — debrief failed, transcript below)"
@@ -1100,7 +1187,8 @@ def start_call_watch(conversation_id, to, goal):
 
 
 # ── SMS negotiation (Twilio Messaging) ─────────────────────────────────────────
-def bankr_complete(messages, max_tokens=300, temperature=0.8):
+def bankr_complete(messages, max_tokens=300, temperature=0.8,
+                   kind="complete", meta=None):
     """One non-streaming completion via the Bankr gateway."""
     body = {"model": FAST_MODEL, "stream": False, "max_tokens": max_tokens,
             "temperature": temperature, "messages": messages}
@@ -1112,9 +1200,16 @@ def bankr_complete(messages, max_tokens=300, temperature=0.8):
     req = urllib.request.Request(f"{BANKR_BASE_URL}/chat/completions",
                                  data=json.dumps(body).encode(),
                                  headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        d = json.loads(resp.read())
-    return (d["choices"][0]["message"]["content"] or "").strip()
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            d = json.loads(resp.read())
+        text = (d["choices"][0]["message"]["content"] or "").strip()
+    except Exception as e:
+        log_llm(kind, body, None, error=e, elapsed=time.time() - t0, meta=meta)
+        raise
+    log_llm(kind, body, text, elapsed=time.time() - t0, meta=meta)
+    return text
 
 
 class SmsAgent:
@@ -1140,7 +1235,7 @@ class SmsAgent:
             history = list(self.threads.get(number, []))
         msgs = [{"role": "system", "content": self._sys(number)}] + history
         try:
-            text = bankr_complete(msgs)[:1500]
+            text = bankr_complete(msgs, kind="sms", meta={"number": number})[:1500]
         except Exception as e:
             print(f"[sms] brain error: {e}", flush=True)
             text = ""
@@ -1274,6 +1369,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(mp3)))
             self.end_headers()
             return self.wfile.write(mp3)
+        if path == "/debug":
+            return self._serve_file(HERE / "debug.html", "text/html; charset=utf-8")
+        if path == "/debug/llm.json":
+            if not self._token_ok():
+                return self.send_error(403, "bad token")
+            with LLM_LOG_LOCK:
+                entries = [_llm_public(e) for e in LLM_LOG]
+            return self._send_json(200, {"entries": entries, "model": FAST_MODEL,
+                                         "sys_prompt": chat_sys_prompt()})
+        if path.startswith("/debug/llm/") and path.endswith(".json"):
+            if not self._token_ok():
+                return self.send_error(403, "bad token")
+            try:
+                eid = int(path[len("/debug/llm/"):-len(".json")])
+            except ValueError:
+                return self.send_error(404, "not found")
+            with LLM_LOG_LOCK:
+                entry = next((e for e in LLM_LOG if e.get("id") == eid), None)
+            if not entry:
+                return self.send_error(404, "not found")
+            return self._send_json(200, entry)
         if path.startswith("/voice/tts/"):
             tid = path.rsplit("/", 1)[-1].removesuffix(".mp3")
             mp3 = PHONE.tts_cache.get(tid)
@@ -1546,11 +1662,15 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[tool] lookup: {query[:100]!r}", flush=True)
         answer = "I couldn't dig that up just now."
         if DEEP_AVAILABLE:
+            prompt = ("Quick lookup, use WebSearch: " + query
+                      + " Reply with ONE short spoken sentence, no links or markdown.")
+            req_log = {"prompt": prompt, "append_system_prompt": DEEP_APPEND_PROMPT,
+                       "args": LOOKUP_ARGS, "cwd": str(DEEP_CWD)}
+            t0 = time.time()
             try:
                 DEEP_CWD.mkdir(parents=True, exist_ok=True)
                 out = deep_run_turn(
-                    "Quick lookup, use WebSearch: " + query
-                    + " Reply with ONE short spoken sentence, no links or markdown.",
+                    prompt,
                     append_system_prompt=DEEP_APPEND_PROMPT,
                     cwd=str(DEEP_CWD),
                     extra_args=shlex.split(LOOKUP_ARGS),
@@ -1558,11 +1678,15 @@ class Handler(BaseHTTPRequestHandler):
                     timeout=LOOKUP_TIMEOUT,
                 )
                 text = out.get("text", "") if isinstance(out, dict) else str(out)
+                log_llm("lookup", req_log, text, elapsed=time.time() - t0,
+                        meta={"query": query})
                 if "SPOKEN SUMMARY:" in text:
                     text = text.rpartition("SPOKEN SUMMARY:")[2]
                 answer = " ".join(text.split())[:700] or answer
             except Exception as e:
                 print(f"[tool] lookup failed: {e}", flush=True)
+                log_llm("lookup", req_log, None, error=e,
+                        elapsed=time.time() - t0, meta={"query": query})
                 answer = "I tried to look but couldn't get through just now."
         body = json.dumps({"answer": answer}).encode()
         self.send_response(200)
@@ -1770,6 +1894,7 @@ def _resolve_voice_names():
 
 
 def main():
+    _load_llm_log()
     if ELEVENLABS_API_KEY:
         threading.Thread(target=_resolve_voice_names, daemon=True).start()
         _load_calls()

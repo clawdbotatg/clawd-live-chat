@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm debug — clawd live</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0b0e17; color: #cdd6f4;
+         font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+  header { position: sticky; top: 0; z-index: 5; display: flex; align-items: center;
+           gap: 12px; padding: 10px 14px; background: #10141f;
+           border-bottom: 1px solid #1e2536; flex-wrap: wrap; }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+  header a { color: #7aa2ff; text-decoration: none; }
+  #model { color: #566080; font-size: 11px; }
+  #count { color: #566080; font-size: 11px; margin-left: auto; }
+  label.auto { color: #8a93b2; font-size: 11px; display: flex; gap: 5px;
+               align-items: center; cursor: pointer; }
+  button { background: #1a2133; color: #cdd6f4; border: 1px solid #2a3350;
+           border-radius: 6px; padding: 4px 10px; font: inherit; cursor: pointer; }
+  button:hover { background: #222b44; }
+  #filters { display: flex; gap: 6px; padding: 10px 14px 0; flex-wrap: wrap; }
+  .chip { border-radius: 999px; padding: 2px 11px; font-size: 11px; cursor: pointer;
+          border: 1px solid #2a3350; background: #131829; color: #8a93b2; }
+  .chip.on { color: #0b0e17; font-weight: 600; }
+  #sysp { margin: 10px 14px 0; }
+  details.box { background: #10141f; border: 1px solid #1e2536; border-radius: 8px; }
+  details.box > summary { padding: 8px 12px; cursor: pointer; color: #8a93b2;
+                          font-size: 12px; user-select: none; }
+  details.box[open] > summary { border-bottom: 1px solid #1e2536; }
+  pre { margin: 0; padding: 10px 12px; white-space: pre-wrap; word-break: break-word;
+        font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+  #list { padding: 10px 14px 60px; display: flex; flex-direction: column; gap: 8px; }
+  .entry { background: #10141f; border: 1px solid #1e2536; border-radius: 8px; }
+  .entry.err { border-color: #6b2a35; }
+  .entry > summary { display: flex; gap: 10px; align-items: baseline; padding: 8px 12px;
+                     cursor: pointer; user-select: none; flex-wrap: wrap; }
+  .entry > summary::-webkit-details-marker { display: none; }
+  .kind { border-radius: 4px; padding: 0 7px; font-size: 11px; font-weight: 700;
+          color: #0b0e17; }
+  .t { color: #566080; font-size: 11px; }
+  .stat { color: #566080; font-size: 11px; }
+  .prev { flex-basis: 100%; color: #8a93b2; font-size: 12px; overflow: hidden;
+          text-overflow: ellipsis; white-space: nowrap; }
+  .prev b { color: #cdd6f4; font-weight: 500; }
+  .prev.err { color: #ff7b8a; }
+  .detail { border-top: 1px solid #1e2536; }
+  .msg { border-bottom: 1px solid #161c2c; }
+  .msg:last-child { border-bottom: none; }
+  .role { display: inline-block; margin: 8px 12px 0; padding: 0 7px; font-size: 10px;
+          font-weight: 700; border-radius: 4px; text-transform: uppercase;
+          letter-spacing: .05em; }
+  .role.system { background: #3d3a1f; color: #ffe08a; }
+  .role.user { background: #1f3d2a; color: #7ee787; }
+  .role.assistant { background: #1f2a4d; color: #7aa2ff; }
+  .role.resp { background: #3a1f4d; color: #d29bff; }
+  .role.error { background: #4d1f27; color: #ff7b8a; }
+  .params { padding: 8px 12px; color: #566080; font-size: 11px;
+            border-bottom: 1px solid #161c2c; }
+  .kindnote { color: #8a93b2; font-size: 11px; }
+  .loading { padding: 12px; color: #566080; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔬 llm debug</h1>
+  <a id="back" href="/">← chat</a>
+  <span id="model"></span>
+  <span id="count"></span>
+  <label class="auto"><input type="checkbox" id="auto" checked> auto-refresh</label>
+  <button id="refresh">refresh</button>
+</header>
+
+<details class="box" id="sysp">
+  <summary>current chat system prompt (composed live per turn)</summary>
+  <pre id="syspText"></pre>
+</details>
+
+<div id="filters"></div>
+<div id="list"></div>
+
+<script>
+const qs = location.search;                    // carries ?t=<token> when bound to LAN
+document.getElementById("back").href = "/" + qs;
+
+const KIND_COLOR = { chat: "#7aa2ff", sms: "#7ee787", debrief: "#ffb86b",
+                     deep: "#d29bff", lookup: "#6be8e0", complete: "#8a93b2" };
+const KIND_NOTE = {
+  chat:     "fast brain — streamed conversation turn (browser/phone/deep-relay)",
+  sms:      "fast brain — text-thread reply",
+  debrief:  "fast brain — post-call debrief of a phone transcript",
+  deep:     "deep worker — claude -p dispatched from the conversation",
+  lookup:   "deep worker — the phone agent's look_up tool",
+  complete: "fast brain — one-off completion",
+};
+
+const open = new Set();      // entry ids the user has expanded
+const detailCache = new Map();
+let entries = [], activeKinds = null;   // null = all
+
+const esc = s => String(s).replace(/[&<>"]/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const hhmmss = ts => new Date(ts * 1000).toLocaleTimeString([], { hour12: false });
+const kb = n => n >= 1024 ? (n / 1024).toFixed(1) + "k" : String(n);
+
+async function load() {
+  let r;
+  try { r = await fetch("/debug/llm.json" + qs); }
+  catch { return; }
+  if (r.status === 403) {
+    document.getElementById("list").innerHTML =
+      '<div class="loading">403 — open this page with the ?t=&lt;token&gt; from the server URL</div>';
+    return;
+  }
+  const d = await r.json();
+  entries = d.entries || [];
+  document.getElementById("model").textContent = d.model || "";
+  document.getElementById("syspText").textContent = d.sys_prompt || "(none)";
+  render();
+}
+
+function render() {
+  const counts = {};
+  for (const e of entries) counts[e.kind] = (counts[e.kind] || 0) + 1;
+  const kinds = Object.keys(counts).sort();
+
+  const fl = document.getElementById("filters");
+  fl.innerHTML = "";
+  const mk = (label, kind) => {
+    const c = document.createElement("span");
+    const on = kind === null ? activeKinds === null : activeKinds?.has(kind);
+    c.className = "chip" + (on ? " on" : "");
+    if (on) c.style.background = kind ? KIND_COLOR[kind] || "#8a93b2" : "#cdd6f4";
+    c.textContent = label;
+    c.onclick = () => {
+      if (kind === null) activeKinds = null;
+      else if (activeKinds?.has(kind) && activeKinds.size === 1) activeKinds = null;
+      else activeKinds = new Set([kind]);
+      render();
+    };
+    fl.appendChild(c);
+  };
+  mk(`all ${entries.length}`, null);
+  for (const k of kinds) mk(`${k} ${counts[k]}`, k);
+
+  const shown = entries.filter(e => !activeKinds || activeKinds.has(e.kind));
+  document.getElementById("count").textContent =
+    `${shown.length} of ${entries.length} call${entries.length === 1 ? "" : "s"}`;
+
+  const list = document.getElementById("list");
+  list.innerHTML = "";
+  for (const e of shown.slice().reverse()) list.appendChild(row(e));
+}
+
+function row(e) {
+  const d = document.createElement("details");
+  d.className = "entry" + (e.error ? " err" : "");
+  d.dataset.id = e.id;
+  if (open.has(e.id)) d.open = true;
+
+  const color = KIND_COLOR[e.kind] || "#8a93b2";
+  const meta = Object.entries(e.meta || {})
+    .map(([k, v]) => `${k}=${String(v).slice(0, 40)}`).join(" ");
+  d.innerHTML = `<summary>
+      <span class="kind" style="background:${color}">${esc(e.kind)}</span>
+      <span class="t">#${e.id} · ${hhmmss(e.ts)}</span>
+      <span class="stat">${e.msgs} msg · ${kb(e.chars)} chars in</span>
+      ${e.elapsed != null ? `<span class="stat">${e.elapsed}s</span>` : ""}
+      ${meta ? `<span class="stat">${esc(meta)}</span>` : ""}
+      <span class="prev ${e.error ? "err" : ""}">${
+        e.error ? "✗ " + esc(e.error)
+                : "→ " + esc(e.prompt) + "  <b>⇒ " + esc(e.response) + "</b>"}</span>
+    </summary><div class="detail"><div class="loading">loading…</div></div>`;
+
+  d.addEventListener("toggle", async () => {
+    if (!d.open) { open.delete(e.id); return; }
+    open.add(e.id);
+    const box = d.querySelector(".detail");
+    let full = detailCache.get(e.id);
+    if (!full) {
+      try {
+        const r = await fetch(`/debug/llm/${e.id}.json` + qs);
+        if (!r.ok) { box.innerHTML = '<div class="loading">gone from the ring buffer</div>'; return; }
+        full = await r.json();
+        detailCache.set(e.id, full);
+      } catch { box.innerHTML = '<div class="loading">fetch failed</div>'; return; }
+    }
+    box.innerHTML = detailHtml(full);
+  });
+  // pre-fill already-open rows on re-render
+  if (d.open && detailCache.has(e.id))
+    d.querySelector(".detail").innerHTML = detailHtml(detailCache.get(e.id));
+  return d;
+}
+
+function detailHtml(f) {
+  const req = f.request || {};
+  let out = `<div class="params">${esc(KIND_NOTE[f.kind] || f.kind)}`;
+  const params = [];
+  if (req.model) params.push("model " + req.model);
+  if (req.temperature != null) params.push("temp " + req.temperature);
+  if (req.max_tokens) params.push("max_tokens " + req.max_tokens);
+  if (req.stream != null) params.push(req.stream ? "streaming" : "non-streaming");
+  if (req.session_id) params.push("session " + req.session_id);
+  if (req.args) params.push("args " + req.args);
+  if (req.cwd) params.push("cwd " + req.cwd);
+  if (params.length) out += " · " + esc(params.join(" · "));
+  out += `</div>`;
+
+  if (req.messages) {
+    for (const m of req.messages)
+      out += `<div class="msg"><span class="role ${esc(m.role)}">${esc(m.role)}</span>
+              <pre>${esc(m.content)}</pre></div>`;
+  } else {
+    if (req.append_system_prompt)
+      out += `<div class="msg"><span class="role system">appended system</span>
+              <pre>${esc(req.append_system_prompt)}</pre></div>`;
+    if (req.prompt)
+      out += `<div class="msg"><span class="role user">prompt</span>
+              <pre>${esc(req.prompt)}</pre></div>`;
+  }
+  if (f.response != null)
+    out += `<div class="msg"><span class="role resp">response${
+      f.elapsed != null ? " · " + f.elapsed + "s" : ""}</span>
+      <pre>${esc(f.response)}</pre></div>`;
+  if (f.error)
+    out += `<div class="msg"><span class="role error">error</span>
+            <pre>${esc(f.error)}</pre></div>`;
+  return out;
+}
+
+document.getElementById("refresh").onclick = load;
+setInterval(() => {
+  if (document.getElementById("auto").checked && !document.hidden) load();
+}, 2500);
+load();
+</script>
+</body>
+</html>
