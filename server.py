@@ -75,6 +75,13 @@ KEY_FILE  = HERE / ".clawd-live-chat.key.pem"
 BANKR_API_KEY  = os.environ.get("BANKR_API_KEY", "")
 BANKR_BASE_URL = os.environ.get("BANKR_BASE_URL", "https://llm.bankr.bot/v1").rstrip("/")
 BANKR_API      = os.environ.get("BANKR_API", "bankr").lower()      # openai | bankr
+# Haiku 4.5: winner of the 2026-07 bench_chat.py sweep (16 fast-tier models on
+# the live system prompt) — 0.98s median to first spoken sentence and the ONLY
+# sub-1s model with perfect [[DEEP:]] dispatch (10/10). Faster models flunked
+# the contract: gpt-5.4-mini (0.53s) says "I'm checking" without dispatching;
+# gpt-5.4-nano speaks the tag aloud. Newer ≠ usable either: claude-sonnet-5 and
+# the qwen/glm/grok tiers think for 3–60s before the first token — reasoning
+# models are not voice models. Re-run bench_chat.py quarterly (next ≈2026-10).
 FAST_MODEL     = os.environ.get("FAST_MODEL", "claude-haiku-4-5-20251001")
 FAST_MAX_TOKENS = int(os.environ.get("FAST_MAX_TOKENS", "700"))
 
@@ -964,10 +971,12 @@ AGENT_LLMS = [
     "gpt-5.4-mini",           # newest mini
     "claude-sonnet-4-6",      # smartest Anthropic model ElevenLabs takes; slower
 ]
-# Probed live 2026-07-09 (PATCH each id, then revert): claude-sonnet-5 (released
-# 2026-06-30) is REJECTED by ElevenLabs, as are claude-haiku-5 / claude-opus-4-8 /
-# gemini-3.5-flash-lite / gemini-4-flash / grok-4-fast; gpt-5.5-mini/nano silently
-# coerce to the 5.4 tier. Re-probe now and then and add sonnet-5 when it lands.
+# Probed live 2026-07-13 (PATCH each id, then revert): claude-sonnet-5 (released
+# 2026-06-30) is still REJECTED by ElevenLabs, as are claude-haiku-5 /
+# claude-opus-4-8 / gemini-3.5-flash-lite / gemini-4-flash / grok-4-fast /
+# gpt-5.6-mini/nano; gpt-5.5-mini silently coerces to the 5.4 tier. Re-probe now
+# and then — but note sonnet-5 measured 7.5s to first token on the Bankr gateway
+# (reasoning tier), so it's not a voice model even once ElevenLabs takes it.
 AGENT_LLM_RE = re.compile(r"[A-Za-z0-9.@_-]{2,64}")
 
 
